@@ -87,16 +87,20 @@ For PDF indexing, all pages are read by default. You can cap this with `AGENT_MA
 
 ## Introducing Multi-Agent Reasoning
 
-You can combine several small local models so the agent reasons with multiple drafts before returning one final answer. Enable it in `.env`:
+You can combine several small local models so the agent answers as a group, not one model after another. The agent now selects how many models to use based on question complexity, then runs the selected models in parallel and merges their drafts into one final answer.
 
 ```env
 AGENT_MULTI_AGENT=on
 AGENT_MULTI_MODELS=gemma3:1b,llama3.2:3b,qwen2.5:1.5b
 AGENT_MULTI_SCOPES=chat,research,book,summarize,correct
+AGENT_MULTI_SMART=on
+AGENT_MULTI_SIMPLE_MODELS=1
+AGENT_MULTI_MEDIUM_MODELS=2
+AGENT_MULTI_HARD_MODELS=0
 AGENT_MULTI_MAX_WORKERS=0
 ```
 
-In this mode, the agent keeps `OLLAMA_MODEL` as the primary model, asks all models in `AGENT_MULTI_MODELS` for drafts, and merges them into one final response. `AGENT_MULTI_MAX_WORKERS=0` means it will use all configured models in parallel. If you prefer lightweight behavior, set `AGENT_MULTI_AGENT=off` to run a single model only.
+`AGENT_MULTI_HARD_MODELS=0` means hard questions use all configured models. `AGENT_MULTI_MAX_WORKERS=0` means all selected models run in parallel. If you want always-all behavior, set `AGENT_MULTI_SMART=off`. If you want single-model behavior, set `AGENT_MULTI_AGENT=off`.
 
 ## Progress and Quality
 

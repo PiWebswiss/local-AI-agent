@@ -85,6 +85,12 @@ services:
       AGENT_MULTI_SCOPES: ${AGENT_MULTI_SCOPES:-chat,research,book,summarize,correct}
       # Optional extra Ollama models (comma-separated) used as draft agents.
       AGENT_MULTI_MODELS: ${AGENT_MULTI_MODELS:-gemma3:1b,llama3.2:3b,qwen2.5:1.5b}
+      # Smart model selection by prompt complexity.
+      AGENT_MULTI_SMART: ${AGENT_MULTI_SMART:-on}
+      # Target model counts by complexity (0 = use all configured models).
+      AGENT_MULTI_SIMPLE_MODELS: ${AGENT_MULTI_SIMPLE_MODELS:-1}
+      AGENT_MULTI_MEDIUM_MODELS: ${AGENT_MULTI_MEDIUM_MODELS:-2}
+      AGENT_MULTI_HARD_MODELS: ${AGENT_MULTI_HARD_MODELS:-0}
       # Parallel worker cap for drafting stage (0 uses all configured models).
       AGENT_MULTI_MAX_WORKERS: ${AGENT_MULTI_MAX_WORKERS:-0}
       # Default draft temperature when model options do not set one.

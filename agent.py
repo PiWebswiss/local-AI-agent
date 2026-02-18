@@ -585,6 +585,14 @@ def _env_flag(name: str, *, default: bool = False) -> bool:
     return raw not in {"0", "off", "false", "no"}
 
 
+def _env_int(name: str, *, default: int) -> int:
+    raw = (os.getenv(name, str(default)) or str(default)).strip()
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
+
+
 def _committee_scopes() -> set[str]:
     raw = (os.getenv("AGENT_MULTI_SCOPES", "chat,research,book,summarize,correct") or "").strip().lower()
     if not raw:
@@ -635,6 +643,96 @@ def _committee_models(primary_model: str) -> list[str]:
     return models
 
 
+def _latest_user_text(messages: list[dict[str, str]]) -> str:
+    for item in reversed(messages):
+        role = str(item.get("role", "") or "").strip().lower()
+        if role != "user":
+            continue
+        return str(item.get("content", "") or "").strip()
+    return ""
+
+
+def _committee_complexity_level(*, scope: str, messages: list[dict[str, str]]) -> str:
+    # Estimate request complexity without extra model calls.
+    text = _latest_user_text(messages)
+    low = text.lower()
+    token_count = len(re.findall(r"\w+", text))
+    char_count = len(text)
+
+    score = 0
+    if scope in {"research", "book"}:
+        score += 2
+
+    if char_count >= 350 or token_count >= 70:
+        score += 1
+    if char_count >= 1400 or token_count >= 260:
+        score += 2
+
+    if re.search(r"https?://", text):
+        score += 1
+
+    complex_markers = (
+        "compare",
+        "versus",
+        " vs ",
+        "tradeoff",
+        "trade-off",
+        "analyze",
+        "analysis",
+        "reason",
+        "explain",
+        "design",
+        "architecture",
+        "latest",
+        "news",
+        "citations",
+        "source",
+        "pourquoi",
+        "comment",
+        "analyse",
+        "comparer",
+        "explique",
+    )
+    if any(marker in low for marker in complex_markers):
+        score += 1
+
+    simple_chat_markers = {"ok", "yes", "no", "thanks", "thank you", "hello", "hi", "hey"}
+    if scope == "chat" and token_count <= 10 and any(low == marker for marker in simple_chat_markers):
+        score -= 1
+
+    if score <= 0:
+        return "simple"
+    if score <= 2:
+        return "medium"
+    return "hard"
+
+
+def _committee_active_models(
+    *,
+    scope: str,
+    messages: list[dict[str, str]],
+    models: list[str],
+) -> tuple[list[str], str]:
+    if not models:
+        return [], "simple"
+
+    if not _env_flag("AGENT_MULTI_SMART", default=True):
+        return models, "hard"
+
+    level = _committee_complexity_level(scope=scope, messages=messages)
+    if level == "simple":
+        target = _env_int("AGENT_MULTI_SIMPLE_MODELS", default=1)
+    elif level == "medium":
+        target = _env_int("AGENT_MULTI_MEDIUM_MODELS", default=2)
+    else:
+        target = _env_int("AGENT_MULTI_HARD_MODELS", default=0)
+
+    # Zero/negative means "use all configured models".
+    if target <= 0:
+        return models, level
+    return models[: max(1, min(len(models), target))], level
+
+
 def _message_excerpt_for_committee(messages: list[dict[str, str]], *, max_messages: int = 8, max_chars: int = 1600) -> str:
     tail = list(messages[-max_messages:])
     parts: list[str] = []
@@ -659,8 +757,9 @@ def _chat_with_committee(
     status_label: str | None = None,
 ) -> str:
     label = (status_label or "Thinking...").strip() or "Thinking..."
-    models = _committee_models(config.model)
-    if len(models) <= 1:
+    all_models = _committee_models(config.model)
+    active_models, complexity = _committee_active_models(scope=scope, messages=messages, models=all_models)
+    if len(active_models) <= 1:
         return _chat_with_retries(
             config=config,
             messages=messages,
@@ -670,7 +769,9 @@ def _chat_with_committee(
         )
 
     if on_status is not None:
-        on_status(f"Multi-agent: drafting with {len(models)} models...")
+        on_status(
+            f"Multi-agent: group drafting with {len(active_models)}/{len(all_models)} models ({complexity})..."
+        )
 
     # Reuse user-provided options and add a default draft temperature when absent.
     draft_options = dict(options or {})
@@ -686,9 +787,9 @@ def _chat_with_committee(
     except Exception:
         configured_workers = 0
     if configured_workers <= 0:
-        max_workers = len(models)
+        max_workers = len(active_models)
     else:
-        max_workers = min(len(models), configured_workers)
+        max_workers = min(len(active_models), configured_workers)
     if max_workers <= 0:
         max_workers = 1
 
@@ -712,7 +813,7 @@ def _chat_with_committee(
 
     completed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(_run_one, model): model for model in models}
+        future_map = {executor.submit(_run_one, model): model for model in active_models}
         for future in concurrent.futures.as_completed(future_map):
             model_name = future_map[future]
             try:
@@ -726,10 +827,10 @@ def _chat_with_committee(
                 errors_by_model[model_name] = err
             completed += 1
             if on_status is not None:
-                on_status(f"Multi-agent: drafts ready {completed}/{len(models)}")
+                on_status(f"Multi-agent: group drafts ready {completed}/{len(active_models)}")
 
     candidates: list[tuple[str, str]] = []
-    for model in models:
+    for model in active_models:
         value = results_by_model.get(model)
         if value:
             candidates.append((model, value))
@@ -748,7 +849,7 @@ def _chat_with_committee(
         return candidates[0][1]
 
     if on_status is not None:
-        on_status("Multi-agent: merging drafts...")
+        on_status("Multi-agent: group merge...")
 
     # Keep merge deterministic and conservative.
     merge_options = dict(options or {})
