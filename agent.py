@@ -620,7 +620,8 @@ def _committee_models(primary_model: str) -> list[str]:
         if key in seen:
             return
         try:
-            validated = local_ollama.validate_model(model, max_b=int(os.getenv("OLLAMA_MAX_B", "4")))
+            # Do not enforce size caps for committee members; use what the user configured.
+            validated = local_ollama.validate_model(model, max_b=0)
         except Exception:
             return
         seen.add(key)
@@ -631,12 +632,7 @@ def _committee_models(primary_model: str) -> list[str]:
     # Add optional extra models from environment list.
     for item in re.split(r"[,\n;|]+", raw):
         _push(item)
-    # Hard cap to avoid launching too many workers/models at once.
-    try:
-        max_models = max(1, min(6, int(os.getenv("AGENT_MULTI_MAX_MODELS", "3"))))
-    except Exception:
-        max_models = 3
-    return models[:max_models]
+    return models
 
 
 def _message_excerpt_for_committee(messages: list[dict[str, str]], *, max_messages: int = 8, max_chars: int = 1600) -> str:
@@ -686,9 +682,13 @@ def _chat_with_committee(
         draft_options["temperature"] = max(0.0, min(1.0, draft_temp))
 
     try:
-        max_workers = max(1, min(len(models), int(os.getenv("AGENT_MULTI_MAX_WORKERS", "3"))))
+        configured_workers = int(os.getenv("AGENT_MULTI_MAX_WORKERS", "0"))
     except Exception:
-        max_workers = min(len(models), 3)
+        configured_workers = 0
+    if configured_workers <= 0:
+        max_workers = len(models)
+    else:
+        max_workers = min(len(models), configured_workers)
     if max_workers <= 0:
         max_workers = 1
 

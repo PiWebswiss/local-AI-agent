@@ -75,8 +75,8 @@ services:
       OLLAMA_HOST: http://ollama:11434
       # Default local model (can be changed in `.env`).
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma3:1b}
-      # Optional guardrail to reject models larger than this size suffix (e.g., 4b).
-      OLLAMA_MAX_B: ${OLLAMA_MAX_B:-4}
+      # Optional model-size guardrail (0 disables cap).
+      OLLAMA_MAX_B: ${OLLAMA_MAX_B:-0}
       # Ollama request timeout (seconds).
       OLLAMA_TIMEOUT_S: ${OLLAMA_TIMEOUT_S:-120}
       # Enable/disable multi-agent drafting and merge pipeline.
@@ -85,10 +85,8 @@ services:
       AGENT_MULTI_SCOPES: ${AGENT_MULTI_SCOPES:-chat,research,book,summarize,correct}
       # Optional extra Ollama models (comma-separated) used as draft agents.
       AGENT_MULTI_MODELS: ${AGENT_MULTI_MODELS:-gemma3:1b,llama3.2:3b,qwen2.5:1.5b}
-      # Hard cap for number of models included in one committee run.
-      AGENT_MULTI_MAX_MODELS: ${AGENT_MULTI_MAX_MODELS:-3}
-      # Parallel worker cap for drafting stage.
-      AGENT_MULTI_MAX_WORKERS: ${AGENT_MULTI_MAX_WORKERS:-3}
+      # Parallel worker cap for drafting stage (0 uses all configured models).
+      AGENT_MULTI_MAX_WORKERS: ${AGENT_MULTI_MAX_WORKERS:-0}
       # Default draft temperature when model options do not set one.
       AGENT_MULTI_DRAFT_TEMP: ${AGENT_MULTI_DRAFT_TEMP:-0.25}
       # OCR.Space API key for image/OCR extraction.

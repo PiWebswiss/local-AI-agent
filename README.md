@@ -25,7 +25,7 @@ OLLAMA_MODEL=gemma3:1b
 OCR_SPACE_API_KEY=your_key_here
 ```
 
-`OLLAMA_MODEL` is only an example. You can use another local model tag such as `gemma3:4b` if your hardware supports it. `OLLAMA_MAX_B` is a safety guard on model size suffixes, and setting `OLLAMA_MAX_B=0` disables that size check.
+`OLLAMA_MODEL` is only an example. You can use another local model tag such as `gemma3:4b` if your hardware supports it. By default, size capping is disabled (`OLLAMA_MAX_B=0`).
 
 If your machine is limited, use single-model mode instead of committee mode:
 
@@ -93,11 +93,10 @@ You can combine several small local models so the agent reasons with multiple dr
 AGENT_MULTI_AGENT=on
 AGENT_MULTI_MODELS=gemma3:1b,llama3.2:3b,qwen2.5:1.5b
 AGENT_MULTI_SCOPES=chat,research,book,summarize,correct
-AGENT_MULTI_MAX_MODELS=3
-AGENT_MULTI_MAX_WORKERS=3
+AGENT_MULTI_MAX_WORKERS=0
 ```
 
-In this mode, the agent asks each configured model for a draft and merges drafts into one final response. You can limit where this runs using `AGENT_MULTI_SCOPES`. Multi-agent mode uses more VRAM/compute, so GPU is strongly recommended. If you prefer lightweight behavior, set `AGENT_MULTI_AGENT=off` to run a single model only.
+In this mode, the agent keeps `OLLAMA_MODEL` as the primary model, asks all models in `AGENT_MULTI_MODELS` for drafts, and merges them into one final response. `AGENT_MULTI_MAX_WORKERS=0` means it will use all configured models in parallel. If you prefer lightweight behavior, set `AGENT_MULTI_AGENT=off` to run a single model only.
 
 ## Progress and Quality
 

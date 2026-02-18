@@ -17,8 +17,8 @@ class OllamaError(RuntimeError):
     pass
 
 
-# Matches model size suffixes like `1b`, `4b`, `70b`.
-_MODEL_SIZE_B_RE = re.compile(r"(?<!\d)(?P<size>[0-9]+)b(?!\w)", re.IGNORECASE)
+# Matches model size suffixes like `1b`, `1.5b`, `4b`, `70b`.
+_MODEL_SIZE_B_RE = re.compile(r"(?<!\d)(?P<size>[0-9]+(?:\.[0-9]+)?)b(?!\w)", re.IGNORECASE)
 
 
 def validate_model(model: str, *, max_b: int = 4) -> str:
@@ -31,7 +31,7 @@ def validate_model(model: str, *, max_b: int = 4) -> str:
     if max_b > 0:
         match = _MODEL_SIZE_B_RE.search(model)
         if match:
-            size_b = int(match.group("size"))
+            size_b = float(match.group("size"))
             if size_b > max_b:
                 raise OllamaError(f"Model '{model}' exceeds max size ({max_b}b).")
     # Return validated model string unchanged.
