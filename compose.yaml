@@ -1,76 +1,135 @@
+# Local AI stack:
+# - `ollama` runs local model inference
+# - `ollama_init` pre-pulls the configured model
+# - `agent` runs the CLI assistant
 services:
   ollama:
+    # Official Ollama runtime image.
     image: ollama/ollama:latest
+    # Allow Docker to expose the available GPU(s) to Ollama.
     gpus: all
     volumes:
+      # Persist downloaded model weights across container restarts.
       - ollama:/root/.ollama
     restart: unless-stopped
     networks:
+      # Internal network for service-to-service traffic.
       - backend
+      # Egress network for outbound HTTPS access.
       - egress
     healthcheck:
+      # Mark service healthy once Ollama responds to `ollama list`.
       test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 30
 
   ollama_init:
+    # Reuse Ollama image to run a one-shot model pull command.
     image: ollama/ollama:latest
     depends_on:
       ollama:
+        # Wait for Ollama API to be healthy before pulling model.
         condition: service_healthy
     networks:
       - backend
       - egress
     environment:
+      # Internal URL used by the pull command.
       OLLAMA_HOST: http://ollama:11434
+      # Model to pull once at startup (configurable from `.env`).
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma3:1b}
-    entrypoint: ["/bin/sh", "-lc", "ollama pull \"$$OLLAMA_MODEL\""]
+      # Optional committee models to pre-pull.
+      AGENT_MULTI_MODELS: ${AGENT_MULTI_MODELS:-gemma3:1b,llama3.2:3b,qwen2.5:1.5b}
+    # Pull primary model and any configured committee models.
+    entrypoint:
+      [
+        "/bin/sh",
+        "-lc",
+        "set -e; ollama pull \"$$OLLAMA_MODEL\"; OLDIFS=\"$$IFS\"; IFS=','; for m in $$AGENT_MULTI_MODELS; do m=\"$${m# }\"; m=\"$${m% }\"; if [ -n \"$$m\" ] && [ \"$$m\" != \"$$OLLAMA_MODEL\" ]; then ollama pull \"$$m\"; fi; done; IFS=\"$$OLDIFS\"",
+      ]
+    # One-shot task: do not restart after completion.
     restart: "no"
 
   agent:
+    # Build local image from Dockerfile in repo root.
     build: .
     depends_on:
       ollama_init:
+        # Start chat container only after model pull succeeds.
         condition: service_completed_successfully
     networks:
       - backend
       - egress
     environment:
+      # Redirect writable app/cache locations into tmpfs because rootfs is read-only.
       HOME: /tmp
       XDG_CACHE_HOME: /tmp/.cache
       XDG_CONFIG_HOME: /tmp/.config
       XDG_DATA_HOME: /tmp/.local/share
+      # RAG index directory mounted from host `./rag`.
       AGENT_RAG_DIR: /rag
+      # Output directory for corrected/generated files (host `./files`).
       AGENT_OUT_DIR: /files
+      # Internal Ollama URL for chat requests.
       OLLAMA_HOST: http://ollama:11434
+      # Default local model (can be changed in `.env`).
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma3:1b}
+      # Optional guardrail to reject models larger than this size suffix (e.g., 4b).
       OLLAMA_MAX_B: ${OLLAMA_MAX_B:-4}
+      # Ollama request timeout (seconds).
       OLLAMA_TIMEOUT_S: ${OLLAMA_TIMEOUT_S:-120}
+      # Enable/disable multi-agent drafting and merge pipeline.
+      AGENT_MULTI_AGENT: ${AGENT_MULTI_AGENT:-on}
+      # Which answer paths should use multi-agent mode.
+      AGENT_MULTI_SCOPES: ${AGENT_MULTI_SCOPES:-chat,research,book,summarize,correct}
+      # Optional extra Ollama models (comma-separated) used as draft agents.
+      AGENT_MULTI_MODELS: ${AGENT_MULTI_MODELS:-gemma3:1b,llama3.2:3b,qwen2.5:1.5b}
+      # Hard cap for number of models included in one committee run.
+      AGENT_MULTI_MAX_MODELS: ${AGENT_MULTI_MAX_MODELS:-3}
+      # Parallel worker cap for drafting stage.
+      AGENT_MULTI_MAX_WORKERS: ${AGENT_MULTI_MAX_WORKERS:-3}
+      # Default draft temperature when model options do not set one.
+      AGENT_MULTI_DRAFT_TEMP: ${AGENT_MULTI_DRAFT_TEMP:-0.25}
+      # OCR.Space API key for image/OCR extraction.
       OCR_SPACE_API_KEY: ${OCR_SPACE_API_KEY:-}
+      # Default OCR language code used when prompt/file does not specify one.
       OCR_SPACE_LANGUAGE: ${OCR_SPACE_LANGUAGE:-eng}
+      # OCR request timeout and upload-size cap.
       OCR_SPACE_TIMEOUT_S: ${OCR_SPACE_TIMEOUT_S:-60}
       OCR_SPACE_MAX_BYTES: ${OCR_SPACE_MAX_BYTES:-8000000}
+    # Harden runtime: read-only root filesystem.
     read_only: true
     tmpfs:
+      # Writable scratch space for temp files and runtime caches.
       - /tmp
     cap_drop:
+      # Drop Linux capabilities to reduce attack surface.
       - ALL
     security_opt:
+      # Prevent privilege escalation via setuid binaries/caps.
       - no-new-privileges:true
+    # Use tini/init process for clean signal handling and child reaping.
     init: true
+    # Keep interactive terminal behavior for chat mode.
     stdin_open: true
     tty: true
     volumes:
+      # Share input/output files with host.
       - ./files:/files
+      # Persist RAG indexes on host.
       - ./rag:/rag
+    # Default command starts interactive chat without MCP helper process.
     command: ["python", "agent.py", "chat", "--no-mcp"]
     restart: "no"
 
 volumes:
+  # Named volume holding Ollama model data.
   ollama:
 
 networks:
   backend:
+    # Internal-only: not reachable from host network.
     internal: true
+  # Normal bridge network for outbound internet access.
   egress:

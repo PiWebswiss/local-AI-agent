@@ -1,8 +1,16 @@
+# Main conversational agent entrypoint.
+# This module handles:
+# - CLI commands (correct/summarize/research/index/chat)
+# - interactive chat routing
+# - web research + source-grounded answering
+# - local book RAG question answering
+# - file correction/summarization flows
 from __future__ import annotations
 
 import atexit
 import argparse
 import asyncio
+import concurrent.futures
 import json
 import os
 import re
@@ -553,6 +561,7 @@ def _chat_with_retries(
             if on_retry is not None:
                 on_retry(attempt, e)
             time.sleep(min(1.5, 0.35 * attempt))
+        # Run cleanup regardless of errors.
         finally:
             if heartbeat_stop is not None:
                 try:
@@ -568,6 +577,265 @@ def _chat_with_retries(
     if last_error is not None:
         raise last_error
     raise RuntimeError("Generation failed without an error.")
+
+
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    fallback = "on" if default else "off"
+    raw = (os.getenv(name, fallback) or fallback).strip().lower()
+    return raw not in {"0", "off", "false", "no"}
+
+
+def _committee_scopes() -> set[str]:
+    raw = (os.getenv("AGENT_MULTI_SCOPES", "chat,research,book,summarize,correct") or "").strip().lower()
+    if not raw:
+        return set()
+    out: set[str] = set()
+    for part in re.split(r"[,\s;|]+", raw):
+        token = (part or "").strip().lower()
+        if token:
+            out.add(token)
+    return out
+
+
+def _committee_enabled_for(scope: str) -> bool:
+    if not _env_flag("AGENT_MULTI_AGENT", default=False):
+        return False
+    scopes = _committee_scopes()
+    if not scopes:
+        return False
+    token = (scope or "").strip().lower()
+    return "all" in scopes or token in scopes
+
+
+def _committee_models(primary_model: str) -> list[str]:
+    raw = (os.getenv("AGENT_MULTI_MODELS", "") or "").strip()
+    seen: set[str] = set()
+    models: list[str] = []
+
+    def _push(value: str) -> None:
+        model = (value or "").strip()
+        if not model:
+            return
+        key = model.lower()
+        if key in seen:
+            return
+        try:
+            validated = local_ollama.validate_model(model, max_b=int(os.getenv("OLLAMA_MAX_B", "4")))
+        except Exception:
+            return
+        seen.add(key)
+        models.append(validated)
+
+    # Always include primary model first.
+    _push(primary_model)
+    # Add optional extra models from environment list.
+    for item in re.split(r"[,\n;|]+", raw):
+        _push(item)
+    # Hard cap to avoid launching too many workers/models at once.
+    try:
+        max_models = max(1, min(6, int(os.getenv("AGENT_MULTI_MAX_MODELS", "3"))))
+    except Exception:
+        max_models = 3
+    return models[:max_models]
+
+
+def _message_excerpt_for_committee(messages: list[dict[str, str]], *, max_messages: int = 8, max_chars: int = 1600) -> str:
+    tail = list(messages[-max_messages:])
+    parts: list[str] = []
+    for i, item in enumerate(tail, start=1):
+        role = str(item.get("role", "user") or "user").strip().lower()
+        if role not in {"system", "user", "assistant"}:
+            role = "user"
+        content = str(item.get("content", "") or "").strip()
+        if len(content) > max_chars:
+            content = content[:max_chars].rstrip() + "..."
+        parts.append(f"[{i}] {role.upper()}:\n{content}")
+    return "\n\n".join(parts)
+
+
+def _chat_with_committee(
+    *,
+    scope: str,
+    config: local_ollama.OllamaConfig,
+    messages: list[dict[str, str]],
+    options: dict[str, Any] | None = None,
+    on_status: Callable[[str], None] | None = None,
+    status_label: str | None = None,
+) -> str:
+    label = (status_label or "Thinking...").strip() or "Thinking..."
+    models = _committee_models(config.model)
+    if len(models) <= 1:
+        return _chat_with_retries(
+            config=config,
+            messages=messages,
+            options=options,
+            on_status=on_status,
+            status_label=label,
+        )
+
+    if on_status is not None:
+        on_status(f"Multi-agent: drafting with {len(models)} models...")
+
+    # Reuse user-provided options and add a default draft temperature when absent.
+    draft_options = dict(options or {})
+    if "temperature" not in draft_options:
+        try:
+            draft_temp = float(os.getenv("AGENT_MULTI_DRAFT_TEMP", "0.25"))
+        except Exception:
+            draft_temp = 0.25
+        draft_options["temperature"] = max(0.0, min(1.0, draft_temp))
+
+    try:
+        max_workers = max(1, min(len(models), int(os.getenv("AGENT_MULTI_MAX_WORKERS", "3"))))
+    except Exception:
+        max_workers = min(len(models), 3)
+    if max_workers <= 0:
+        max_workers = 1
+
+    results_by_model: dict[str, str] = {}
+    errors_by_model: dict[str, str] = {}
+
+    def _run_one(model_name: str) -> tuple[str, str | None, str | None]:
+        model_config = local_ollama.OllamaConfig(host=config.host, model=model_name, timeout_s=config.timeout_s)
+        try:
+            text = _chat_with_retries(
+                config=model_config,
+                messages=messages,
+                options=draft_options,
+                max_attempts=2,
+                on_status=None,
+                status_label=label,
+            )
+            return model_name, text, None
+        except Exception as e:
+            return model_name, None, str(e)
+
+    completed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(_run_one, model): model for model in models}
+        for future in concurrent.futures.as_completed(future_map):
+            model_name = future_map[future]
+            try:
+                model_name, text, err = future.result()
+            except Exception as e:
+                text = None
+                err = str(e)
+            if text:
+                results_by_model[model_name] = text
+            elif err:
+                errors_by_model[model_name] = err
+            completed += 1
+            if on_status is not None:
+                on_status(f"Multi-agent: drafts ready {completed}/{len(models)}")
+
+    candidates: list[tuple[str, str]] = []
+    for model in models:
+        value = results_by_model.get(model)
+        if value:
+            candidates.append((model, value))
+
+    if not candidates:
+        # All worker drafts failed; fall back to primary model with regular retry logic.
+        return _chat_with_retries(
+            config=config,
+            messages=messages,
+            options=options,
+            on_status=on_status,
+            status_label=label,
+        )
+
+    if len(candidates) == 1:
+        return candidates[0][1]
+
+    if on_status is not None:
+        on_status("Multi-agent: merging drafts...")
+
+    # Keep merge deterministic and conservative.
+    merge_options = dict(options or {})
+    merge_options["temperature"] = 0.0
+    try:
+        merge_num_predict = int(merge_options.get("num_predict", 900))
+    except Exception:
+        merge_num_predict = 900
+    merge_options["num_predict"] = max(200, min(1200, merge_num_predict))
+    try:
+        merge_num_ctx = int(merge_options.get("num_ctx", 4096))
+    except Exception:
+        merge_num_ctx = 4096
+    merge_options["num_ctx"] = max(2048, merge_num_ctx)
+
+    context_text = _message_excerpt_for_committee(messages)
+    candidate_blocks = "\n\n".join(
+        f"[{idx}] model={model_name}\n{answer.strip()}"
+        for idx, (model_name, answer) in enumerate(candidates, start=1)
+    )
+    merge_system = (
+        "You are a lead assistant combining drafts from multiple local models.\n"
+        "Produce one final answer for the user.\n"
+        "Rules:\n"
+        "- Keep only claims supported by the conversation context.\n"
+        "- If context includes sources/excerpts, stay grounded in them.\n"
+        "- Do not mention internal draft numbers or model names.\n"
+        "- Be concise and practical.\n"
+        "Return only the final answer text."
+    )
+    merge_user = (
+        f"Scope: {scope}\n\n"
+        f"Conversation context:\n{context_text}\n\n"
+        f"Draft answers:\n{candidate_blocks}"
+    )
+
+    try:
+        merged = _chat_with_retries(
+            config=config,
+            messages=[{"role": "system", "content": merge_system}, {"role": "user", "content": merge_user}],
+            options=merge_options,
+            max_attempts=2,
+            on_status=on_status,
+            status_label="Multi-agent: finalizing answer...",
+        ).strip()
+        if merged:
+            return merged
+    except Exception:
+        pass
+
+    # If merge fails, prefer primary-model draft when available.
+    primary = config.model
+    for model_name, answer in candidates:
+        if model_name == primary:
+            return answer
+    # Otherwise return the first successful draft.
+    return candidates[0][1]
+
+
+def _generate_answer(
+    *,
+    scope: str,
+    config: local_ollama.OllamaConfig,
+    messages: list[dict[str, str]],
+    options: dict[str, Any] | None = None,
+    on_status: Callable[[str], None] | None = None,
+    status_label: str | None = None,
+    max_attempts: int | None = None,
+) -> str:
+    label = (status_label or "Thinking...").strip() or "Thinking..."
+    if not _committee_enabled_for(scope):
+        return _chat_with_retries(
+            config=config,
+            messages=messages,
+            options=options,
+            max_attempts=max_attempts,
+            on_status=on_status,
+            status_label=label,
+        )
+    return _chat_with_committee(
+        scope=scope,
+        config=config,
+        messages=messages,
+        options=options,
+        on_status=on_status,
+        status_label=label,
+    )
 
 
 def correct_text(text: str, *, language: str, config: local_ollama.OllamaConfig) -> str:
@@ -599,7 +867,8 @@ def correct_text(text: str, *, language: str, config: local_ollama.OllamaConfig)
             "Reply only with the corrected text."
         )
 
-    return _chat_with_retries(
+    return _generate_answer(
+        scope="correct",
         config=config,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": text}],
         options={"temperature": 0.0, "num_ctx": 4096, "num_predict": 2048},
@@ -685,7 +954,8 @@ def summarize_text(
     }[length]
 
     user = f"Summarize this text. {length_hint}\n\n{text}"
-    return _chat_with_retries(
+    return _generate_answer(
+        scope="summarize",
         config=config,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         options={"temperature": 0.2, "num_ctx": 4096, "num_predict": 1024},
@@ -797,6 +1067,7 @@ def _decide_mode_for_prompt(
     *,
     has_active_book: bool,
     config: local_ollama.OllamaConfig,
+    on_status: Callable[[str], None] | None = None,
 ) -> tuple[str, dict[str, str]]:
     """
     Decide one execution mode: web|book|chat|correct|summarize.
@@ -808,7 +1079,19 @@ def _decide_mode_for_prompt(
     if intent == "research":
         return "web", {**base_route, "action": "research"}
 
-    route = _route_with_llm(prompt, config=config)
+    # In active book mode, default to book for substantive questions.
+    # This avoids unnecessary router LLM calls (faster + visible behavior).
+    if has_active_book:
+        if _looks_like_web_request(prompt):
+            return "web", {**base_route, "action": "research"}
+        if _looks_like_book_request(prompt):
+            return "book", base_route
+        if not _looks_like_small_talk(prompt):
+            return "book", base_route
+
+    if on_status:
+        on_status("Understanding request...")
+    route = _route_with_llm(prompt, config=config, on_status=on_status)
     action = route.get("action", "chat")
     if action not in {"correct", "summarize", "research", "chat"}:
         action = "chat"
@@ -858,6 +1141,8 @@ class _ChatUI:
         if phase_style not in {"line", "inline"}:
             phase_style = "line"
         self.phase_style = phase_style
+        phase_echo = (os.getenv("AGENT_PHASE_ECHO", "on") or "on").strip().lower()
+        self.phase_echo = phase_echo not in {"0", "off", "false", "no"}
         try:
             self.status_clear_s = max(0.0, float(os.getenv("AGENT_STATUS_CLEAR_S", "10")))
         except Exception:
@@ -898,14 +1183,17 @@ class _ChatUI:
             self._last_status_text = ""
 
     def _set_status_line(self, message: str) -> None:
+        # When rich spinner is active, rely on it and avoid duplicate phase lines.
         if self.spinner:
+            return
+        if not self.phase_echo:
             return
         text = (message or "").strip()
         if not text:
             return
         if len(text) > 200:
             text = text[:197].rstrip() + "..."
-        line = f"[Phase] {text}"
+        line = text
         with self._status_lock:
             now = time.time()
             if line == self._last_status_text and (now - self._last_status_ts) < self.status_repeat_s:
@@ -955,8 +1243,9 @@ class _ChatUI:
 
     @contextmanager
     def status(self, message: str) -> Iterator[Any | None]:
-        if not self.spinner:
+        if self.phase_echo:
             self._set_status_line(message)
+        if not self.spinner:
             yield None
             return
         with self.console.status(message) as status:
@@ -972,6 +1261,7 @@ class _ChatUI:
                 return
             try:
                 status.update(text)
+                self._set_status_line(text)
             except Exception:
                 self._set_status_line(text)
                 return
@@ -1000,7 +1290,12 @@ def _strip_leading_instruction(line: str, *, action: str) -> str:
     return s
 
 
-def _route_with_llm(user_text: str, *, config: local_ollama.OllamaConfig) -> dict:
+def _route_with_llm(
+    user_text: str,
+    *,
+    config: local_ollama.OllamaConfig,
+    on_status: Callable[[str], None] | None = None,
+) -> dict:
     system = (
         "You are an intent router for a local assistant.\n"
         "Return ONLY valid JSON, no markdown, no extra text.\n"
@@ -1025,6 +1320,8 @@ def _route_with_llm(user_text: str, *, config: local_ollama.OllamaConfig) -> dic
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user_text}],
         options={"temperature": 0.0, "num_ctx": 2048, "num_predict": 256},
         max_attempts=2,
+        on_status=on_status,
+        status_label="Understanding request...",
     )
     data = _parse_json_dict(raw)
     if not isinstance(data, dict):
@@ -1171,6 +1468,239 @@ def _looks_like_followup_summary_request(line: str) -> bool:
     return len(text.split()) <= 20
 
 
+_PERSON_NAME_RE = re.compile(
+    r"\b(?:Mr|Mrs|Miss|Dr|General|Judge|Juge|Docteur|Monsieur|Madame|M(?:me|lle)?)\.?\s+"
+    r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+(?:\s+[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+){0,2}\b"
+    r"|\b[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+(?:\s+[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+){1,2}\b"
+)
+
+
+def _normalize_match_text(text: str) -> str:
+    folded = unicodedata.normalize("NFKD", text or "")
+    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    folded = folded.lower()
+    folded = re.sub(r"\s+", " ", folded).strip()
+    return folded
+
+
+def _is_person_identity_question(
+    question: str,
+    *,
+    config: local_ollama.OllamaConfig,
+    on_status: Callable[[str], None] | None = None,
+) -> bool:
+    try:
+        min_conf = float(os.getenv("AGENT_IDENTITY_MIN_CONF", "0.80"))
+    except Exception:
+        min_conf = 0.80
+    min_conf = max(0.0, min(1.0, min_conf))
+
+    system = (
+        "Classify user questions.\n"
+        "Return ONLY JSON: {\"person_identity\": true|false, \"confidence\": 0..1}\n"
+        "Set person_identity=true ONLY when the user explicitly asks to identify a person/character "
+        "(examples: who is..., which person..., what is the name of...).\n"
+        "If the question asks why/when/how/about events, actions, motives, or explanations, return false even if names are present.\n"
+        "confidence must reflect certainty in the classification."
+    )
+    raw = _chat_with_retries(
+        config=config,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": question}],
+        options={"temperature": 0.0, "num_ctx": 1024, "num_predict": 80},
+        max_attempts=2,
+        on_status=on_status,
+        status_label="Classifying question...",
+    )
+    data = _parse_json_dict(raw)
+    if not isinstance(data, dict):
+        return False
+    value = data.get("person_identity")
+    is_identity = False
+    if isinstance(value, bool):
+        is_identity = value
+    elif isinstance(value, str):
+        is_identity = value.strip().lower() in {"true", "1", "yes"}
+    elif isinstance(value, (int, float)):
+        is_identity = bool(value)
+
+    if not is_identity:
+        return False
+
+    conf_raw = data.get("confidence")
+    conf = 0.0
+    try:
+        if isinstance(conf_raw, str):
+            conf = float(conf_raw.strip())
+        elif isinstance(conf_raw, (int, float)):
+            conf = float(conf_raw)
+    except Exception:
+        conf = 0.0
+
+    return conf >= min_conf
+
+
+def _extract_person_names(text: str) -> list[str]:
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    reject_norm = {
+        "le livre",
+        "sources",
+        "chunk",
+        "chapter",
+        "book",
+    }
+    for m in _PERSON_NAME_RE.finditer(raw):
+        name = " ".join(m.group(0).split())
+        norm = _normalize_match_text(name)
+        if not norm or norm in reject_norm:
+            continue
+        if len(norm) < 3:
+            continue
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(name)
+    return out
+
+
+def _answer_mentions_supported_name(answer: str, source_blocks: list[str]) -> bool:
+    names = _extract_person_names(answer)
+    if not names:
+        return True
+    source_norm = _normalize_match_text("\n".join(source_blocks))
+    for name in names:
+        if _normalize_match_text(name) in source_norm:
+            return True
+    return False
+
+
+def _question_keywords(question: str) -> list[str]:
+    _ = question
+    return []
+
+
+def _best_person_from_sources(question: str, source_blocks: list[str]) -> tuple[str | None, int | None]:
+    _ = question
+    _ = source_blocks
+    return None, None
+
+
+def _fallback_supported_person_answer(question: str, source_blocks: list[str]) -> str | None:
+    _ = question
+    _ = source_blocks
+    return None
+    # Conservative fallback: avoid overconfident guesses.
+    # If the heuristic picked an obvious investigator/profession title, skip it.
+    low_name = _normalize_match_text(name)
+    if any(low_name.startswith(prefix) for prefix in ("dr ", "docteur ", "judge ", "juge ")):
+        return None
+    lang = _infer_prompt_language(question)
+    if lang == "fr":
+        if ref is not None:
+            return f"D’après les extraits fournis, la réponse la mieux étayée est : {name} [{ref}]."
+        return f"D’après les extraits fournis, la réponse la mieux étayée est : {name}."
+    if ref is not None:
+        return f"Based on the provided excerpts, the best-supported answer is: {name} [{ref}]."
+    return f"Based on the provided excerpts, the best-supported answer is: {name}."
+
+
+def _resolve_who_answer_with_sources(
+    *,
+    question: str,
+    source_blocks: list[str],
+    config: local_ollama.OllamaConfig,
+    on_status: Callable[[str], None] | None = None,
+) -> str | None:
+    if not source_blocks:
+        return None
+    system = (
+        "You resolve person-identity questions from excerpts.\n"
+        "Return ONLY JSON with this schema:\n"
+        '{"person":"...", "answer":"...", "evidence":[1,2], "supported":true}\n'
+        "Rules:\n"
+        "- person must appear verbatim in excerpts.\n"
+        "- Do not choose investigators/explainers unless excerpt explicitly says they are the victim asked about.\n"
+        "- If uncertain, return {\"person\":\"\", \"answer\":\"\", \"evidence\":[], \"supported\":false}.\n"
+    )
+    user = f"Question:\n{question}\n\nExcerpts:\n\n" + "\n\n".join(source_blocks)
+    raw = _chat_with_retries(
+        config=config,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        options={"temperature": 0.0, "num_ctx": 4096, "num_predict": 500},
+        max_attempts=2,
+        on_status=on_status,
+        status_label="Resolving person...",
+    )
+    data = _parse_json_dict(raw)
+    if not isinstance(data, dict):
+        return None
+    supported = bool(data.get("supported"))
+    person = str(data.get("person", "") or "").strip()
+    answer = str(data.get("answer", "") or "").strip()
+    if not supported or not person:
+        return None
+    if _normalize_match_text(person) not in _normalize_match_text("\n".join(source_blocks)):
+        return None
+    if answer:
+        return answer
+    return person
+
+
+def _uncertain_identity_response(
+    *,
+    question: str,
+    source_blocks: list[str],
+    config: local_ollama.OllamaConfig,
+    on_status: Callable[[str], None] | None = None,
+) -> str:
+    system = (
+        "You answer person-identity questions using excerpts.\n"
+        "When certainty is not possible, respond with ONE short sentence in the user's language.\n"
+        "State that the provided excerpts are insufficient to identify the person with certainty.\n"
+        "Do not guess.\n"
+        "Do not include any person name.\n"
+    )
+    user = f"Question:\n{question}\n\nExcerpts:\n\n" + "\n\n".join(source_blocks)
+    text = _chat_with_retries(
+        config=config,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        options={"temperature": 0.0, "num_ctx": 2048, "num_predict": 120},
+        max_attempts=2,
+        on_status=on_status,
+        status_label="Writing safe answer...",
+    ).strip()
+    if text and not _extract_person_names(text):
+        return text
+    lang = _infer_prompt_language(question)
+    if lang == "fr":
+        return "Je ne peux pas identifier la personne avec certitude à partir des extraits fournis."
+    return "I can't identify the person with certainty from the provided excerpts."
+
+
+def _looks_like_uncertain_identity_answer(answer: str) -> bool:
+    norm = _normalize_match_text(answer or "")
+    if not norm:
+        return False
+    hints = (
+        "i can't identify",
+        "i cannot identify",
+        "cannot identify",
+        "can't determine",
+        "cannot determine",
+        "not enough information",
+        "insufficient",
+        "je ne peux pas identifier",
+        "impossible d'identifier",
+        "pas assez d'informations",
+        "insuffisant",
+        "avec certitude",
+    )
+    return any(h in norm for h in hints)
+
+
 def _verify_grounded_answer(
     *,
     question: str,
@@ -1183,10 +1713,17 @@ def _verify_grounded_answer(
         return draft_answer
     if not source_blocks:
         return draft_answer
+    is_person_identity = _is_person_identity_question(
+        question,
+        config=config,
+        on_status=on_status,
+    )
 
     system = (
         "You are a strict verifier for grounded answers.\n"
         "Check whether the draft answer is fully supported by the provided sources.\n"
+        "If any claim is unsupported, verdict must be fail.\n"
+        "For person/entity questions (who/which person), the entity must appear explicitly in sources.\n"
         "Return ONLY JSON with this schema:\n"
         '{"verdict":"pass|fail","issues":["..."],"revised_answer":"..."}\n'
         "Rules for revised_answer:\n"
@@ -1211,13 +1748,40 @@ def _verify_grounded_answer(
         status_label="Verifying answer...",
     )
     data = _parse_json_dict(raw)
+    verdict = ""
+    revised = ""
     if isinstance(data, dict):
         verdict = str(data.get("verdict", "")).strip().lower()
         revised = str(data.get("revised_answer", "") or "").strip()
-        if verdict in {"pass", "ok", "supported"}:
-            return revised or draft_answer
-        if revised:
+    candidate = revised or draft_answer
+
+    if is_person_identity:
+        if verdict in {"pass", "ok", "supported"} and _answer_mentions_supported_name(candidate, source_blocks):
+            return candidate
+
+        resolved = _resolve_who_answer_with_sources(
+            question=question,
+            source_blocks=source_blocks,
+            config=config,
+            on_status=on_status,
+        )
+        if resolved and _answer_mentions_supported_name(resolved, source_blocks):
+            return resolved
+
+        if revised and _answer_mentions_supported_name(revised, source_blocks):
             return revised
+
+        return _uncertain_identity_response(
+            question=question,
+            source_blocks=source_blocks,
+            config=config,
+            on_status=on_status,
+        )
+
+    if verdict in {"pass", "ok", "supported"}:
+        return candidate
+    if revised:
+        return revised
 
     # Fallback: if verifier did not return usable JSON, keep draft.
     return draft_answer
@@ -1361,7 +1925,8 @@ async def research_answer(
 
     if on_status:
         on_status("Writing answer...")
-    answer = _chat_with_retries(
+    answer = _generate_answer(
+        scope="research",
         config=config,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         options={"temperature": 0.2, "num_ctx": 4096, "num_predict": 1200},
@@ -1421,6 +1986,75 @@ def _default_book_name_for_path(path: str) -> str:
         return "book"
 
 
+def _build_book_context(
+    *,
+    question: str,
+    index: rag.RAGIndex,
+    book_name: str,
+    top_k: int,
+    max_chars_per_chunk: int,
+    neighbor_window: int,
+    max_context_chunks: int,
+) -> tuple[list[str], list[str]]:
+    top_k = max(1, min(int(top_k), 60))
+    max_chars_per_chunk = max(200, int(max_chars_per_chunk))
+    neighbor_window = max(0, min(int(neighbor_window), 4))
+    max_context_chunks = max(1, min(int(max_context_chunks), 80))
+
+    retrieved = index.search(question, top_k=top_k)
+    if not retrieved:
+        return [], []
+
+    chunk_by_id = {ch.chunk_id: ch for ch in index.chunks}
+    expanded: list[rag.RetrievedChunk] = []
+    seen_chunk_ids: set[int] = set()
+    for hit in retrieved:
+        for delta in range(-neighbor_window, neighbor_window + 1):
+            cid = hit.chunk_id + delta
+            if cid in seen_chunk_ids:
+                continue
+            chunk = chunk_by_id.get(cid)
+            if chunk is None:
+                continue
+            seen_chunk_ids.add(cid)
+            expanded.append(
+                rag.RetrievedChunk(
+                    chunk_id=chunk.chunk_id,
+                    score=max(0.0, float(hit.score) - (0.0001 * abs(delta))),
+                    start=chunk.start,
+                    end=chunk.end,
+                    text=chunk.text,
+                    page_start=chunk.page_start,
+                    page_end=chunk.page_end,
+                )
+            )
+            if len(expanded) >= max_context_chunks:
+                break
+        if len(expanded) >= max_context_chunks:
+            break
+    retrieved = expanded or retrieved
+
+    blocks: list[str] = []
+    sources: list[str] = []
+    for i, ch in enumerate(retrieved, start=1):
+        text = ch.text.strip()
+        if len(text) > max_chars_per_chunk:
+            text = text[:max_chars_per_chunk].rstrip() + "..."
+        if ch.page_start is not None and ch.page_end is not None:
+            if ch.page_start == ch.page_end:
+                loc_label = f"Page {ch.page_start}"
+                source_label = f"book:{book_name}#page{ch.page_start}"
+            else:
+                loc_label = f"Pages {ch.page_start}-{ch.page_end}"
+                source_label = f"book:{book_name}#pages{ch.page_start}-{ch.page_end}"
+        else:
+            loc_label = f"Excerpt {ch.chunk_id}"
+            source_label = f"book:{book_name}#excerpt{ch.chunk_id}"
+        blocks.append(f"[{i}] {loc_label}\n{text}")
+        sources.append(source_label)
+    return blocks, sources
+
+
 def book_answer(
     question: str,
     *,
@@ -1432,23 +2066,61 @@ def book_answer(
     verify_answers: bool = True,
     on_status: Callable[[str], None] | None = None,
 ) -> tuple[str, list[str]]:
-    top_k = max(1, min(int(top_k), 20))
+    top_k = max(1, min(int(top_k), 40))
     max_chars_per_chunk = max(200, int(max_chars_per_chunk))
+    try:
+        neighbor_window = max(0, min(2, int(os.getenv("AGENT_RAG_NEIGHBOR_WINDOW", "1"))))
+    except Exception:
+        neighbor_window = 1
+    try:
+        max_context_chunks = max(1, min(30, int(os.getenv("AGENT_RAG_MAX_CONTEXT_CHUNKS", "18"))))
+    except Exception:
+        max_context_chunks = 18
+    try:
+        book_num_predict = max(200, min(1200, int(os.getenv("AGENT_BOOK_NUM_PREDICT", "700"))))
+    except Exception:
+        book_num_predict = 700
+
+    is_person_identity = False
+    try:
+        is_person_identity = _is_person_identity_question(
+            question,
+            config=config,
+            on_status=on_status,
+        )
+    except Exception:
+        is_person_identity = False
+
+    if is_person_identity:
+        try:
+            identity_top_k = max(top_k, min(40, int(os.getenv("AGENT_BOOK_IDENTITY_TOP_K", "12"))))
+        except Exception:
+            identity_top_k = max(top_k, 12)
+        try:
+            identity_neighbor = max(neighbor_window, min(3, int(os.getenv("AGENT_BOOK_IDENTITY_NEIGHBOR_WINDOW", "2"))))
+        except Exception:
+            identity_neighbor = max(neighbor_window, 2)
+        try:
+            identity_max_ctx = max(max_context_chunks, min(60, int(os.getenv("AGENT_BOOK_IDENTITY_MAX_CONTEXT_CHUNKS", "36"))))
+        except Exception:
+            identity_max_ctx = max(max_context_chunks, 36)
+        top_k = identity_top_k
+        neighbor_window = identity_neighbor
+        max_context_chunks = identity_max_ctx
 
     if on_status:
         on_status("Retrieving passages...")
-    retrieved = index.search(question, top_k=top_k)
-    if not retrieved:
+    blocks, sources = _build_book_context(
+        question=question,
+        index=index,
+        book_name=book_name,
+        top_k=top_k,
+        max_chars_per_chunk=max_chars_per_chunk,
+        neighbor_window=neighbor_window,
+        max_context_chunks=max_context_chunks,
+    )
+    if not blocks:
         return ("I couldn't find relevant passages in the book index for that question.", [])
-
-    blocks: list[str] = []
-    sources: list[str] = []
-    for i, ch in enumerate(retrieved, start=1):
-        text = ch.text.strip()
-        if len(text) > max_chars_per_chunk:
-            text = text[:max_chars_per_chunk].rstrip() + "..."
-        blocks.append(f"[{i}] Chunk {ch.chunk_id}\n{text}")
-        sources.append(f"book:{book_name}#chunk{ch.chunk_id}")
 
     system = (
         "You are an assistant answering questions about a book. "
@@ -1461,10 +2133,11 @@ def book_answer(
 
     if on_status:
         on_status("Writing answer...")
-    answer = _chat_with_retries(
+    answer = _generate_answer(
+        scope="book",
         config=config,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        options={"temperature": 0.2, "num_ctx": 4096, "num_predict": 1000},
+        options={"temperature": 0.2, "num_ctx": 4096, "num_predict": book_num_predict},
         on_status=on_status,
         status_label="Writing answer...",
     )
@@ -1476,6 +2149,51 @@ def book_answer(
             config=config,
             on_status=on_status,
         )
+        if is_person_identity and _looks_like_uncertain_identity_answer(answer):
+            try:
+                retry_top_k = max(top_k, min(60, int(os.getenv("AGENT_BOOK_IDENTITY_RETRY_TOP_K", "24"))))
+            except Exception:
+                retry_top_k = max(top_k, 24)
+            try:
+                retry_neighbor = max(neighbor_window, min(4, int(os.getenv("AGENT_BOOK_IDENTITY_RETRY_NEIGHBOR_WINDOW", "3"))))
+            except Exception:
+                retry_neighbor = max(neighbor_window, 3)
+            try:
+                retry_max_ctx = max(max_context_chunks, min(80, int(os.getenv("AGENT_BOOK_IDENTITY_RETRY_MAX_CONTEXT_CHUNKS", "56"))))
+            except Exception:
+                retry_max_ctx = max(max_context_chunks, 56)
+
+            if on_status:
+                on_status("Retrying with wider book context...")
+            retry_blocks, retry_sources = _build_book_context(
+                question=question,
+                index=index,
+                book_name=book_name,
+                top_k=retry_top_k,
+                max_chars_per_chunk=max_chars_per_chunk,
+                neighbor_window=retry_neighbor,
+                max_context_chunks=retry_max_ctx,
+            )
+            if retry_blocks and (len(retry_blocks) > len(blocks) or retry_sources != sources):
+                retry_user = f"Question: {question}\n\nExcerpts:\n\n" + "\n\n".join(retry_blocks)
+                retry_answer = _generate_answer(
+                    scope="book",
+                    config=config,
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": retry_user}],
+                    options={"temperature": 0.1, "num_ctx": 4096, "num_predict": book_num_predict},
+                    on_status=on_status,
+                    status_label="Writing answer...",
+                )
+                retry_answer = _verify_grounded_answer(
+                    question=question,
+                    draft_answer=retry_answer,
+                    source_blocks=retry_blocks,
+                    config=config,
+                    on_status=on_status,
+                )
+                answer = retry_answer
+                blocks = retry_blocks
+                sources = retry_sources
     return answer, sources
 
 
@@ -1514,6 +2232,15 @@ async def cmd_research(args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_for_rag_index(file_path: str, *, max_chars: int) -> tuple[str, list[tuple[int, int, int]] | None]:
+    ext = Path(file_path).suffix.lower()
+    if ext == ".pdf":
+        text, page_spans = file_readers.read_pdf_with_page_spans(file_path, max_chars=max_chars)
+        return text, (page_spans or None)
+    text = file_readers.read_any_file(file_path, max_chars=max_chars)
+    return text, None
+
+
 async def cmd_index(args: argparse.Namespace) -> int:
     rag_dir = _rag_dir(args)
     resolved = _resolve_existing_file_path(args.file)
@@ -1523,13 +2250,14 @@ async def cmd_index(args: argparse.Namespace) -> int:
     name = rag.sanitize_index_name(name)
 
     try:
-        text = file_readers.read_any_file(file_path, max_chars=int(args.max_chars))
+        text, page_spans = _read_for_rag_index(file_path, max_chars=int(args.max_chars))
     except file_readers.FileReadError as e:
         raise SystemExit(str(e)) from e
 
     idx = rag.build_index_from_text(
         text,
         source={"file": file_path},
+        page_spans=page_spans,
         chunk_chars=int(args.chunk_chars),
         overlap_chars=int(args.overlap_chars),
         min_chunk_chars=int(args.min_chunk_chars),
@@ -1606,7 +2334,7 @@ async def cmd_chat(args: argparse.Namespace) -> int:
         _save_chat_memory(memory_path, messages=chat_memory)
 
     def _phase_note(msg: str) -> None:
-        ui.print_plain(f"[Phase] {msg}", extra_newline=False)
+        ui.print_plain(msg, extra_newline=False)
 
     print(f"Model: {config.model}  |  Ollama: {config.host}")
     if _auto_book_mode_enabled():
@@ -1749,12 +2477,13 @@ async def cmd_chat(args: argparse.Namespace) -> int:
                 with ui.status("Indexing book...") as status:
                     if status is not None:
                         status.update("Reading file...")
-                    text = file_readers.read_any_file(file_path, max_chars=max_chars)
+                    text, page_spans = _read_for_rag_index(file_path, max_chars=max_chars)
                     if status is not None:
                         status.update("Building index...")
                     idx = rag.build_index_from_text(
                         text,
                         source={"file": file_path},
+                        page_spans=page_spans,
                         chunk_chars=chunk_chars,
                         overlap_chars=overlap_chars,
                         min_chunk_chars=min_chunk_chars,
@@ -1776,7 +2505,8 @@ async def cmd_chat(args: argparse.Namespace) -> int:
             _announce_mode(ui, "chat", "general answer")
             messages = [{"role": "system", "content": system}, *chat_memory, {"role": "user", "content": payload}]
             with ui.status("Thinking...") as status:
-                out = _chat_with_retries(
+                out = _generate_answer(
+                    scope="chat",
                     config=config,
                     messages=messages,
                     options={"temperature": 0.4, "num_ctx": 4096, "num_predict": 800},
@@ -1884,11 +2614,13 @@ async def cmd_chat(args: argparse.Namespace) -> int:
             _remember_exchange(line, msg)
             continue
 
-        mode, route = _decide_mode_for_prompt(
-            line,
-            has_active_book=active_index is not None and active_book is not None,
-            config=config,
-        )
+        with ui.status("Understanding request...") as status:
+            mode, route = _decide_mode_for_prompt(
+                line,
+                has_active_book=active_index is not None and active_book is not None,
+                config=config,
+                on_status=ui.status_callback(status),
+            )
 
         if mode == "book":
             if active_index is None or active_book is None:
@@ -2042,7 +2774,8 @@ async def cmd_chat(args: argparse.Namespace) -> int:
         _announce_mode(ui, "chat", "general answer")
         messages = [{"role": "system", "content": system}, *chat_memory, {"role": "user", "content": prompt}]
         with ui.status("Thinking...") as status:
-            out = _chat_with_retries(
+            out = _generate_answer(
+                scope="chat",
                 config=config,
                 messages=messages,
                 options={"temperature": 0.4, "num_ctx": 4096, "num_predict": 800},

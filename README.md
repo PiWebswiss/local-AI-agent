@@ -1,110 +1,138 @@
 # Local AI Agent
 
-This project runs a local AI assistant with Docker. The assistant can correct text, summarize text, read files from `./files`, save generated files back to `./files`, search the web with HTTPS sources, answer from indexed books with RAG, and keep short chat memory between turns.
+This project runs a local AI assistant with Docker. It can chat, correct text, summarize text, read many file formats from `./files`, save generated files back to `./files`, browse HTTPS web sources with citations, answer questions from indexed books with local RAG, and keep short memory across turns.
 
 ## Technologies
 
-This project uses [Python](https://www.python.org/) for the agent logic, [Docker](https://www.docker.com/) and [Docker Compose](https://docs.docker.com/compose/) for runtime orchestration, and [Ollama](https://github.com/ollama/ollama) for local language model inference. Web research is handled through local web tooling with optional [FastMCP](https://github.com/jlowin/fastmcp) integration, and image OCR uses the [OCR.Space API](https://ocr.space/). Document question answering uses a local RAG index stored in `./rag` with BM25-style retrieval implemented in the project code. If you want the original inspiration/source repos, see [AIAgent-MCP](https://github.com/AhilanPonnusamy/AIAgent-MCP) and [FastMCP](https://github.com/jlowin/fastmcp).
+This project uses [Python](https://www.python.org/), [Docker Engine](https://docs.docker.com/engine/), [Docker Compose](https://docs.docker.com/compose/), and [Ollama](https://github.com/ollama/ollama). Web retrieval is done through local web tools with optional [FastMCP](https://github.com/jlowin/fastmcp). OCR for images uses the [OCR.Space API](https://ocr.space/). The local document QA system uses BM25-style RAG indexes stored in `./rag`. Original inspiration repositories are [AIAgent-MCP](https://github.com/AhilanPonnusamy/AIAgent-MCP) and [FastMCP](https://github.com/jlowin/fastmcp).
 
-## Quick Start
+## Quick Start (Docker only)
 
-Install Docker (Engine + Compose). Docker Desktop is not required. Then copy `.env.example` to `.env`:
+Install Docker Engine and Docker Compose. Docker Desktop is not required.
+
+The current `compose.yaml` is GPU-enabled (`gpus: all` for Ollama). For best performance, run on a machine with a supported GPU.
+
+Create your environment file:
 
 ```powershell
 copy .env.example .env
 ```
 
-Open `.env` and set at least:
+Edit `.env` and set at least:
 
 ```env
 OLLAMA_MODEL=gemma3:1b
 OCR_SPACE_API_KEY=your_key_here
 ```
 
-You can keep these defaults or change them if you want. `OLLAMA_MODEL` is just an example and can be any local Ollama model tag, including but not limited to `gemma3:4b`. `OCR_SPACE_API_KEY` is only required if you want OCR on image files. If your model tag contains a size like `8b`, make sure `OLLAMA_MAX_B` is high enough (or set to `0` to disable that size check).
+`OLLAMA_MODEL` is only an example. You can use another local model tag such as `gemma3:4b` if your hardware supports it. `OLLAMA_MAX_B` is a safety guard on model size suffixes, and setting `OLLAMA_MAX_B=0` disables that size check.
 
-For image OCR, the agent chooses OCR language from the prompt (for example French prompts use `fre`, English prompts use `eng`) and shows the current OCR language in phase output. If language cannot be inferred, it falls back to `OCR_SPACE_LANGUAGE` from `.env` (default `eng`).
+If your machine is limited, use single-model mode instead of committee mode:
 
-`OLLAMA_MAX_B` is a safety limit for model size. It helps prevent loading a model that is too large for your machine. For example, with `OLLAMA_MAX_B=4`, a model like `8b` is blocked. If you want to allow any size, set `OLLAMA_MAX_B=0`.
+```env
+AGENT_MULTI_AGENT=off
+OLLAMA_MODEL=gemma3:1b
+```
 
-Start the assistant with:
+Start the assistant:
 
 ```powershell
 docker compose run --rm --build agent
 ```
 
-The first run downloads the model and can take time. To stop chat, press `Ctrl+C`. If you want to shut down everything and remove all volumes, run:
-
-```powershell
-docker compose down -v
-```
-
-## How to Use
-
-Put your input files in `./files` and then ask naturally in chat. You can write prompts like `Correct this: i has a apple.`, `Summarize this file: test.docx`, `What is the latest AI news today?`, or `Summarize https://example.com/page`. The assistant automatically chooses the best mode between web, book, chat, correct, and summarize.
-
-## Book RAG
-
-If you want Q&A on a document, place the book in `./files` and build an index:
-
-```powershell
-docker compose run --rm agent python agent.py index --file book.pdf --name mybook
-```
-
-Then start chat and load the index:
+After the first setup, start normally with:
 
 ```powershell
 docker compose run --rm agent
 ```
 
-Inside chat, use `/book mybook` and ask your questions. By default, chat auto-loads the most recent index on startup. You can disable it with `AGENT_AUTO_BOOK=off` in `.env`, or force a specific one with `AGENT_DEFAULT_BOOK=<index_name>`.
-
-For PDF indexing, all pages are read by default. If you want to cap pages for speed, set `AGENT_MAX_PDF_PAGES` in `.env` to a positive number.
-
-## Chat Commands
-
-You can type `/help` to see commands. You can force web mode with `/research <query>`. You can control verification with `/quality on` or `/quality off`. You can check and clear memory with `/memory` and `/memory clear`. You can switch book mode with `/book <name>` and `/book off`.
-
-## Progress Visibility
-
-During long tasks, the assistant shows an animated spinner with live phase text such as searching, fetching URLs, writing, and verifying. If you prefer plain text status lines, run chat with `--no-spinner`. You can tune status behavior with `AGENT_PHASE_STYLE`, `AGENT_STATUS_REPEAT_S`, and `AGENT_STATUS_CLEAR_S`.
-
-When model generation takes time, it also prints periodic thinking updates with elapsed seconds. You can tune that interval with `AGENT_THINK_HEARTBEAT_S`.
-
-## Files and Output
-
-Generated files are saved in `./files`. If a filename already exists, the assistant automatically creates a new name with a `_note`, `_note2`, or `_note3` suffix.
-
-## Troubleshooting
-
-If you changed code or settings, run a clean build:
-
-```powershell
-docker compose run --rm --build agent
-```
-
-To stop services:
-
-```powershell
-docker compose down
-```
-
-To stop services and remove volumes for a full reset:
+Stop chat with `Ctrl+C`. Stop and remove everything, including volumes, with:
 
 ```powershell
 docker compose down -v
 ```
 
-If file reading fails, confirm the file is really inside `./files` and that the format is valid.
+## Natural Usage
 
-## Report Mistakes or Bugs
+Put files in `./files`, then talk naturally. The router chooses between `web`, `book`, `chat`, `correct`, and `summarize` modes automatically.
 
-If you find a mistake, please open an issue and include the prompt, full terminal output, file name and type used, date and time, and your OS.
+```text
+Correct this: i has a apple.
+Summarize this file: test.docx
+What is the latest AI news today?
+Summarize https://example.com/page
+```
+
+Generated files are always saved to `./files`. If a filename already exists, the agent creates a unique name with `_note`, `_note2`, and so on.
+
+## Book Q&A (RAG)
+
+To ask questions about a new book, index it once:
+
+```powershell
+docker compose run --rm agent python agent.py index --file book.pdf
+```
+
+You can provide `--name mybook` if you want a custom index name. If `--name` is not provided, the name is derived from the file name.
+
+Then start chat:
+
+```powershell
+docker compose run --rm agent
+```
+
+Inside chat, load a specific index with `/book mybook` or disable book mode with `/book off`. By default, the latest index auto-loads on startup. You can disable that with `AGENT_AUTO_BOOK=off`, or force a specific default with `AGENT_DEFAULT_BOOK=<index_name>`.
+
+For PDF indexing, all pages are read by default. You can cap this with `AGENT_MAX_PDF_PAGES`.
+
+## Introducing Multi-Agent Reasoning
+
+You can combine several small local models so the agent reasons with multiple drafts before returning one final answer. Enable it in `.env`:
+
+```env
+AGENT_MULTI_AGENT=on
+AGENT_MULTI_MODELS=gemma3:1b,llama3.2:3b,qwen2.5:1.5b
+AGENT_MULTI_SCOPES=chat,research,book,summarize,correct
+AGENT_MULTI_MAX_MODELS=3
+AGENT_MULTI_MAX_WORKERS=3
+```
+
+In this mode, the agent asks each configured model for a draft and merges drafts into one final response. You can limit where this runs using `AGENT_MULTI_SCOPES`. Multi-agent mode uses more VRAM/compute, so GPU is strongly recommended. If you prefer lightweight behavior, set `AGENT_MULTI_AGENT=off` to run a single model only.
+
+## Progress and Quality
+
+The terminal shows live phases such as understanding, searching, fetching, writing, and verifying. You can tune visibility with `AGENT_PHASE_ECHO`, `AGENT_PHASE_STYLE`, `AGENT_STATUS_REPEAT_S`, `AGENT_STATUS_CLEAR_S`, and `AGENT_THINK_HEARTBEAT_S`.
+
+Quality controls are enabled by default and include grounded verification against sources and stricter retries for uncertain answers. You can switch this in chat with `/quality on` and `/quality off`.
+
+## OCR Language
+
+For OCR, the agent infers language from the prompt and displays the active OCR language while processing. If prompt language is unclear, it falls back to `OCR_SPACE_LANGUAGE` from `.env` (default `eng`).
+
+## Troubleshooting
+
+If configuration or code changed, rebuild:
+
+```powershell
+docker compose run --rm --build agent
+```
+
+If you want a full reset:
+
+```powershell
+docker compose down -v
+```
+
+If file reading fails, verify the file is inside `./files` and that the file itself is valid.
+
+## Report Issues
+
+If you find a bug or wrong answer, please report it with the exact prompt, full terminal output, file name and type (if used), date/time, and operating system.
 
 ## Disclaimer
 
-This project is still under active development. Behavior, commands, and outputs can change at any time. Always review important results before using them in production or in legal, medical, or financial contexts.
+This project is under active development. Behavior, commands, and outputs can change at any time. Review important outputs before production or high-stakes use.
 
 ## License
 
-This project is licensed under Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0). See `LICENSE` for details and the full legal code link.
+This project is licensed under Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0). See `LICENSE` for details.
