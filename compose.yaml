@@ -1,0 +1,76 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    gpus: all
+    volumes:
+      - ollama:/root/.ollama
+    restart: unless-stopped
+    networks:
+      - backend
+      - egress
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  ollama_init:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - backend
+      - egress
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma3:1b}
+    entrypoint: ["/bin/sh", "-lc", "ollama pull \"$$OLLAMA_MODEL\""]
+    restart: "no"
+
+  agent:
+    build: .
+    depends_on:
+      ollama_init:
+        condition: service_completed_successfully
+    networks:
+      - backend
+      - egress
+    environment:
+      HOME: /tmp
+      XDG_CACHE_HOME: /tmp/.cache
+      XDG_CONFIG_HOME: /tmp/.config
+      XDG_DATA_HOME: /tmp/.local/share
+      AGENT_RAG_DIR: /rag
+      AGENT_OUT_DIR: /files
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma3:1b}
+      OLLAMA_MAX_B: ${OLLAMA_MAX_B:-4}
+      OLLAMA_TIMEOUT_S: ${OLLAMA_TIMEOUT_S:-120}
+      OCR_SPACE_API_KEY: ${OCR_SPACE_API_KEY:-}
+      OCR_SPACE_LANGUAGE: ${OCR_SPACE_LANGUAGE:-eng}
+      OCR_SPACE_TIMEOUT_S: ${OCR_SPACE_TIMEOUT_S:-60}
+      OCR_SPACE_MAX_BYTES: ${OCR_SPACE_MAX_BYTES:-8000000}
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./files:/files
+      - ./rag:/rag
+    command: ["python", "agent.py", "chat", "--no-mcp", "--no-spinner"]
+    restart: "no"
+
+volumes:
+  ollama:
+
+networks:
+  backend:
+    internal: true
+  egress:
