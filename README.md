@@ -2,6 +2,10 @@
 
 This project runs a local AI assistant with Docker. The assistant can correct text, summarize text, read files from `./files`, save generated files back to `./files`, search the web with HTTPS sources, answer from indexed books with RAG, and keep short chat memory between turns.
 
+## Technologies
+
+This project uses [Python](https://www.python.org/) for the agent logic, [Docker](https://www.docker.com/) and [Docker Compose](https://docs.docker.com/compose/) for runtime orchestration, and [Ollama](https://github.com/ollama/ollama) for local language model inference. Web research is handled through local web tooling with optional [FastMCP](https://github.com/jlowin/fastmcp) integration, and image OCR uses the [OCR.Space API](https://ocr.space/). Document question answering uses a local RAG index stored in `./rag` with BM25-style retrieval implemented in the project code. If you want the original inspiration/source repos, see [AIAgent-MCP](https://github.com/AhilanPonnusamy/AIAgent-MCP) and [FastMCP](https://github.com/jlowin/fastmcp).
+
 ## Quick Start
 
 Install Docker (Engine + Compose). Docker Desktop is not required. Then copy `.env.example` to `.env`:
@@ -18,6 +22,8 @@ OCR_SPACE_API_KEY=your_key_here
 ```
 
 You can keep these defaults or change them if you want. `OLLAMA_MODEL` is just an example and can be any local Ollama model tag, including but not limited to `gemma3:4b`. `OCR_SPACE_API_KEY` is only required if you want OCR on image files. If your model tag contains a size like `8b`, make sure `OLLAMA_MAX_B` is high enough (or set to `0` to disable that size check).
+
+For image OCR, the agent chooses OCR language from the prompt (for example French prompts use `fre`, English prompts use `eng`) and shows the current OCR language in phase output. If language cannot be inferred, it falls back to `OCR_SPACE_LANGUAGE` from `.env` (default `eng`).
 
 `OLLAMA_MAX_B` is a safety limit for model size. It helps prevent loading a model that is too large for your machine. For example, with `OLLAMA_MAX_B=4`, a model like `8b` is blocked. If you want to allow any size, set `OLLAMA_MAX_B=0`.
 
@@ -53,13 +59,15 @@ docker compose run --rm agent
 
 Inside chat, use `/book mybook` and ask your questions. By default, chat auto-loads the most recent index on startup. You can disable it with `AGENT_AUTO_BOOK=off` in `.env`, or force a specific one with `AGENT_DEFAULT_BOOK=<index_name>`.
 
+For PDF indexing, all pages are read by default. If you want to cap pages for speed, set `AGENT_MAX_PDF_PAGES` in `.env` to a positive number.
+
 ## Chat Commands
 
 You can type `/help` to see commands. You can force web mode with `/research <query>`. You can control verification with `/quality on` or `/quality off`. You can check and clear memory with `/memory` and `/memory clear`. You can switch book mode with `/book <name>` and `/book off`.
 
 ## Progress Visibility
 
-During long tasks, the assistant shows phase updates such as searching, fetching URLs, writing, and verifying. The default style is line-by-line status output because it is clearer in Docker terminals. You can change it in `.env` with `AGENT_PHASE_STYLE=inline` if you prefer one updating line. You can tune refresh and clear timing with `AGENT_STATUS_REPEAT_S` and `AGENT_STATUS_CLEAR_S`.
+During long tasks, the assistant shows an animated spinner with live phase text such as searching, fetching URLs, writing, and verifying. If you prefer plain text status lines, run chat with `--no-spinner`. You can tune status behavior with `AGENT_PHASE_STYLE`, `AGENT_STATUS_REPEAT_S`, and `AGENT_STATUS_CLEAR_S`.
 
 When model generation takes time, it also prints periodic thinking updates with elapsed seconds. You can tune that interval with `AGENT_THINK_HEARTBEAT_S`.
 

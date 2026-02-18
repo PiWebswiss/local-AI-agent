@@ -10,6 +10,7 @@ import shlex
 import sys
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -117,26 +118,32 @@ def _resolve_existing_file_path(maybe_path: str) -> Path | None:
     return None
 
 
-def _maybe_read_local_file(maybe_path: str) -> tuple[str | None, str | None]:
-    p = _resolve_existing_file_path(maybe_path)
-    if p is not None:
+def _maybe_read_local_file(
+    maybe_path: str,
+    *,
+    ocr_language: str | None = None,
+    on_status: Callable[[str], None] | None = None,
+) -> tuple[str | None, str | None]:
+    def _read_resolved(path: Path) -> tuple[str | None, str | None]:
         try:
-            return file_readers.read_any_file(str(p)), None
+            if path.suffix.lower() in _IMAGE_EXTS and on_status is not None:
+                lang = (ocr_language or os.getenv("OCR_SPACE_LANGUAGE") or os.getenv("OCR_SPACE_LANG") or "eng").strip().lower()
+                on_status(f"OCR language: {lang} ({_ocr_language_label(lang)})")
+            return file_readers.read_any_file(str(path), ocr_language=ocr_language), None
         except file_readers.FileReadError as e:
             return None, str(e)
         except Exception as e:
-            return None, f"Failed to read file: {p} ({e})"
+            return None, f"Failed to read file: {path} ({e})"
+
+    p = _resolve_existing_file_path(maybe_path)
+    if p is not None:
+        return _read_resolved(p)
 
     for candidate in _extract_file_mentions(maybe_path):
         resolved = _resolve_existing_file_path(candidate)
         if resolved is None:
             continue
-        try:
-            return file_readers.read_any_file(str(resolved)), None
-        except file_readers.FileReadError as e:
-            return None, str(e)
-        except Exception as e:
-            return None, f"Failed to read file: {resolved} ({e})"
+        return _read_resolved(resolved)
 
     return None, None
 
@@ -183,6 +190,7 @@ _FILE_EXTS = (
     "tiff",
 )
 _FILE_EXTS_RE = "|".join(_FILE_EXTS)
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 
 
 def _clean_file_mention(s: str) -> str:
@@ -231,6 +239,91 @@ def _extract_file_mentions(text: str) -> list[str]:
         seen.add(key)
         unique_mentions.append(mention)
     return unique_mentions
+
+
+def _normalize_for_lang_detection(text: str) -> str:
+    s = unicodedata.normalize("NFKD", text or "")
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s.lower()
+
+
+def _infer_prompt_language(prompt: str) -> str:
+    raw = (prompt or "").strip()
+    if not raw:
+        return "en"
+    low = _normalize_for_lang_detection(raw)
+
+    fr_words = {
+        "bonjour",
+        "salut",
+        "merci",
+        "corrige",
+        "corriger",
+        "resumer",
+        "resume",
+        "fichier",
+        "texte",
+        "pourquoi",
+        "comment",
+        "quand",
+        "avec",
+        "sans",
+        "dans",
+        "est",
+        "une",
+        "des",
+        "les",
+        "qui",
+    }
+    en_words = {
+        "hello",
+        "thanks",
+        "please",
+        "correct",
+        "summarize",
+        "summary",
+        "file",
+        "text",
+        "why",
+        "how",
+        "when",
+        "with",
+        "without",
+        "in",
+        "is",
+        "the",
+        "what",
+        "who",
+    }
+
+    tokens = re.findall(r"[a-z]+", low)
+    fr_hits = sum(1 for t in tokens if t in fr_words)
+    en_hits = sum(1 for t in tokens if t in en_words)
+
+    if re.search(r"[àâäçéèêëîïôöùûüÿœ]", raw.lower()):
+        fr_hits += 2
+    if fr_hits >= en_hits + 1:
+        return "fr"
+    return "en"
+
+
+def _ocr_language_from_prompt(prompt: str, *, preferred_language: str = "auto") -> str:
+    pref = (preferred_language or "auto").strip().lower()
+    if pref == "fr":
+        return "fre"
+    if pref == "en":
+        return "eng"
+    inferred = _infer_prompt_language(prompt)
+    return "fre" if inferred == "fr" else "eng"
+
+
+def _ocr_language_label(code: str) -> str:
+    c = (code or "").strip().lower()
+    if c == "fre":
+        return "French"
+    if c == "eng":
+        return "English"
+    return c or "unknown"
 
 
 def _parse_save_transform_request(line: str) -> dict[str, str] | None:
@@ -329,6 +422,7 @@ def _save_file_transform(
     action: str,
     config: local_ollama.OllamaConfig,
     language: str = "auto",
+    ocr_language: str | None = None,
     summary_length: str = "short",
     on_status: Callable[[str], None] | None = None,
 ) -> None:
@@ -354,7 +448,7 @@ def _save_file_transform(
 
     if on_status is not None:
         on_status("Reading file...")
-    text = file_readers.read_any_file(str(input_path))
+    text = file_readers.read_any_file(str(input_path), ocr_language=ocr_language)
 
     if action == "correct":
         if on_status is not None:
@@ -1511,6 +1605,9 @@ async def cmd_chat(args: argparse.Namespace) -> int:
         )
         _save_chat_memory(memory_path, messages=chat_memory)
 
+    def _phase_note(msg: str) -> None:
+        ui.print_plain(f"[Phase] {msg}", extra_newline=False)
+
     print(f"Model: {config.model}  |  Ollama: {config.host}")
     if _auto_book_mode_enabled():
         auto_book = _pick_default_book_name(rag_dir=rag_dir)
@@ -1695,6 +1792,7 @@ async def cmd_chat(args: argparse.Namespace) -> int:
         if task is not None:
             in_req = task["in"]
             out_req = task["out"]
+            ocr_lang = _ocr_language_from_prompt(line, preferred_language="auto")
             resolved_in = _resolve_existing_file_path(in_req)
             if resolved_in is None:
                 ui.print_plain(f"File not found: {in_req}", extra_newline=True)
@@ -1716,6 +1814,7 @@ async def cmd_chat(args: argparse.Namespace) -> int:
                         action=task["action"],
                         config=config,
                         language="auto",
+                        ocr_language=ocr_lang,
                         summary_length="short",
                         on_status=ui.status_callback(status),
                     )
@@ -1736,7 +1835,8 @@ async def cmd_chat(args: argparse.Namespace) -> int:
         # Hidden power commands (optional).
         if line.startswith(("/correct ", "/corrige ")):
             payload = line.split(" ", 1)[1].strip()
-            file_text, file_err = _maybe_read_local_file(payload)
+            ocr_lang = _ocr_language_from_prompt(line, preferred_language="auto")
+            file_text, file_err = _maybe_read_local_file(payload, ocr_language=ocr_lang, on_status=_phase_note)
             if file_err:
                 ui.print_plain(file_err, extra_newline=True)
                 continue
@@ -1750,7 +1850,8 @@ async def cmd_chat(args: argparse.Namespace) -> int:
             continue
         if line.startswith(("/summarize ", "/resume ")):
             payload = line.split(" ", 1)[1].strip()
-            file_text, file_err = _maybe_read_local_file(payload)
+            ocr_lang = _ocr_language_from_prompt(line, preferred_language="auto")
+            file_text, file_err = _maybe_read_local_file(payload, ocr_language=ocr_lang, on_status=_phase_note)
             if file_err:
                 ui.print_plain(file_err, extra_newline=True)
                 continue
@@ -1819,6 +1920,7 @@ async def cmd_chat(args: argparse.Namespace) -> int:
         if action == "correct":
             target = (route.get("text") or "").strip() or line
             target = _strip_leading_instruction(target, action="correct")
+            ocr_lang = _ocr_language_from_prompt(line, preferred_language=route.get("language", "auto"))
             resolved_in = _resolve_file_from_text(target) or _resolve_file_from_text(line)
             if resolved_in is not None and not _looks_like_save_request(line):
                 requested_out_path = _safe_output_path(
@@ -1837,6 +1939,7 @@ async def cmd_chat(args: argparse.Namespace) -> int:
                             action="correct",
                             config=config,
                             language=route.get("language", "auto"),
+                            ocr_language=ocr_lang,
                             on_status=ui.status_callback(status),
                         )
                     host_hint = ""
@@ -1852,7 +1955,7 @@ async def cmd_chat(args: argparse.Namespace) -> int:
                     ui.print_plain(f"Failed to save corrected file: {e}", extra_newline=True)
                 continue
 
-            file_text, file_err = _maybe_read_local_file(target)
+            file_text, file_err = _maybe_read_local_file(target, ocr_language=ocr_lang, on_status=_phase_note)
             if file_err:
                 ui.print_plain(file_err, extra_newline=True)
                 continue
@@ -1868,7 +1971,8 @@ async def cmd_chat(args: argparse.Namespace) -> int:
         if action == "summarize":
             target = (route.get("text") or "").strip() or line
             target = _strip_leading_instruction(target, action="summarize")
-            file_text, file_err = _maybe_read_local_file(target)
+            ocr_lang = _ocr_language_from_prompt(line, preferred_language=route.get("language", "auto"))
+            file_text, file_err = _maybe_read_local_file(target, ocr_language=ocr_lang, on_status=_phase_note)
             if file_err:
                 ui.print_plain(file_err, extra_newline=True)
                 continue

@@ -64,7 +64,7 @@ services:
     volumes:
       - ./files:/files
       - ./rag:/rag
-    command: ["python", "agent.py", "chat", "--no-mcp", "--no-spinner"]
+    command: ["python", "agent.py", "chat", "--no-mcp"]
     restart: "no"
 
 volumes:

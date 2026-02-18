@@ -82,7 +82,7 @@ def _read_pdf(path: Path) -> str:
         raise FileReadError(f"Failed to open PDF: {path} ({e})") from e
 
     parts: list[str] = []
-    max_pages = int(os.getenv("AGENT_MAX_PDF_PAGES", "60"))
+    max_pages = int(os.getenv("AGENT_MAX_PDF_PAGES", "0"))
     for i, page in enumerate(reader.pages):
         if max_pages > 0 and i >= max_pages:
             break
@@ -190,16 +190,16 @@ def _read_xlsx(path: Path) -> str:
     return "\n".join(out).strip()
 
 
-def _read_image_ocr(path: Path) -> str:
+def _read_image_ocr(path: Path, *, language: str | None = None) -> str:
     data = _read_bytes(path, max_bytes=int(os.getenv("OCR_SPACE_MAX_BYTES", "8000000")))
-    lang = os.getenv("OCR_SPACE_LANGUAGE") or os.getenv("OCR_SPACE_LANG")
+    lang = (language or "").strip() or os.getenv("OCR_SPACE_LANGUAGE") or os.getenv("OCR_SPACE_LANG")
     try:
         return ocr_api.ocr_image_bytes(data, filename=path.name, language=lang)
     except ocr_api.OCRSpaceError as e:
         raise FileReadError(str(e)) from e
 
 
-def read_any_file(path: str, *, max_chars: int | None = None) -> str:
+def read_any_file(path: str, *, max_chars: int | None = None, ocr_language: str | None = None) -> str:
     """
     Best-effort text extraction from many file types.
 
@@ -228,7 +228,7 @@ def read_any_file(path: str, *, max_chars: int | None = None) -> str:
             raise FileReadError("HTML file looks binary/unreadable.")
         return _truncate(_html_to_text(_decode_text_bytes(data)), max_chars=max_chars)
     if ext in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
-        return _truncate(_read_image_ocr(p), max_chars=max_chars)
+        return _truncate(_read_image_ocr(p, language=ocr_language), max_chars=max_chars)
 
     data = _read_bytes(p, max_bytes=max_bytes)
     if _is_probably_binary(data):
