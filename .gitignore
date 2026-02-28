@@ -48,5 +48,5 @@ certs/*
 !certs/.gitkeep
 
 # Other
-README.pdf
 tools
+README.pdf

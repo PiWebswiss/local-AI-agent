@@ -35,6 +35,12 @@ except Exception:  # pragma: no cover
 
 
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_CHAT_SYSTEM_PROMPT = (
+    "You are a careful assistant. "
+    "Answer directly and concisely. "
+    "Do not invent facts, names, companies, brands, places, or dates. "
+    "If uncertain, say you are unsure and suggest a web lookup."
+)
 
 
 def _setup_line_editing() -> None:
@@ -652,15 +658,150 @@ def _latest_user_text(messages: list[dict[str, str]]) -> str:
     return ""
 
 
+def _extract_primary_question(*, scope: str, text: str) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    if scope in {"research", "book"}:
+        # Research/book prompts embed large source blocks after "Question:".
+        match = re.search(r"(?is)\bquestion\s*:\s*(.+?)(?:\n\s*\n(?:sources|excerpts)\s*:|\Z)", raw)
+        if match:
+            candidate = str(match.group(1) or "").strip()
+            if candidate:
+                return candidate
+    if raw.lower().startswith("question:"):
+        candidate = raw[len("question:") :].strip()
+        if candidate:
+            return candidate
+    return raw
+
+
+def _looks_like_weather_query(text: str) -> bool:
+    low = (text or "").strip().lower()
+    if not low:
+        return False
+    markers = (
+        "weather",
+        "wheater",
+        "forecast",
+        "temperature",
+        "temp",
+        "humidity",
+        "wind",
+        "rain",
+        "snow",
+        "sunrise",
+        "sunset",
+        "precipitation",
+    )
+    return any(marker in low for marker in markers)
+
+
+def _looks_like_simple_research_lookup(text: str) -> bool:
+    low = (text or "").strip().lower()
+    if not low:
+        return False
+    token_count = len(re.findall(r"\w+", low))
+    if token_count == 0 or token_count > 18:
+        return False
+    if re.search(r"https?://", low):
+        return False
+    simple_markers = (
+        "weather",
+        "wheater",
+        "forecast",
+        "temperature",
+        "temp",
+        "humidity",
+        "wind",
+        "what time",
+        "time in ",
+        "date today",
+        "today date",
+        "exchange rate",
+        "stock price",
+        "price of ",
+        "score today",
+    )
+    if any(marker in low for marker in simple_markers):
+        return True
+    starts = (
+        "weather in ",
+        "forecast for ",
+        "what is the weather",
+        "what's the weather",
+        "how is the weather",
+    )
+    return low.startswith(starts)
+
+
+def _looks_like_fact_lookup_query(text: str) -> bool:
+    low = (text or "").strip().lower()
+    if not low:
+        return False
+    if re.search(r"https?://", low):
+        return False
+    if _looks_like_small_talk(low):
+        return False
+
+    # Focus on short factual lookup prompts where hallucinations are common without verification.
+    token_count = len(re.findall(r"\w+", low))
+    if token_count == 0 or token_count > 24:
+        return False
+
+    patterns = (
+        r"^\s*who\s+is\b",
+        r"^\s*what\s+is\b",
+        r"^\s*where\s+is\b",
+        r"^\s*when\s+(is|was)\b",
+        r"^\s*which\s+is\b",
+        r"^\s*is\s+.+\?\s*$",
+        r"^\s*qui\s+est\b",
+        r"^\s*c[' ]?est\s+quoi\b",
+        r"^\s*qu[' ]?est[- ]?ce\s+que\b",
+        r"^\s*ou\s+est\b",
+        r"^\s*quand\s+est\b",
+    )
+    return any(re.search(pat, low) for pat in patterns)
+
+
+def _looks_like_confidence_challenge(text: str) -> bool:
+    low = (text or "").strip().lower()
+    if not low:
+        return False
+    markers = (
+        "are you sure",
+        "you sure",
+        "really",
+        "is it correct",
+        "is that correct",
+        "verify that",
+        "double check",
+        "double-check",
+        "tu es sur",
+        "tu es sûr",
+        "t'es sur",
+        "t'es sûr",
+        "vraiment",
+        "tu confirmes",
+    )
+    return any(m in low for m in markers)
+
+
 def _committee_complexity_level(*, scope: str, messages: list[dict[str, str]]) -> str:
     # Estimate request complexity without extra model calls.
-    text = _latest_user_text(messages)
+    text = _extract_primary_question(scope=scope, text=_latest_user_text(messages))
     low = text.lower()
     token_count = len(re.findall(r"\w+", text))
     char_count = len(text)
 
     score = 0
     if scope in {"research", "book"}:
+        score += 1
+
+    if scope == "research" and _looks_like_simple_research_lookup(text):
+        score -= 2
+    if scope == "chat" and (_looks_like_fact_lookup_query(text) or _looks_like_confidence_challenge(text)):
         score += 2
 
     if char_count >= 350 or token_count >= 70:
@@ -707,11 +848,53 @@ def _committee_complexity_level(*, scope: str, messages: list[dict[str, str]]) -
     return "hard"
 
 
+def _committee_complexity_with_llm(
+    *,
+    scope: str,
+    messages: list[dict[str, str]],
+    config: local_ollama.OllamaConfig,
+) -> str | None:
+    if scope not in {"research", "book"}:
+        return None
+    question = _extract_primary_question(scope=scope, text=_latest_user_text(messages))
+    if not question:
+        return None
+
+    system = (
+        "You select model budget for a local multi-model assistant.\n"
+        "Return ONLY JSON: {\"complexity\":\"simple|medium|hard\"}\n"
+        "simple: short/direct lookup with one focused objective.\n"
+        "medium: some synthesis or several related facts.\n"
+        "hard: multi-step reasoning, comparisons, ambiguity, or broad analysis."
+    )
+    user = f"Scope: {scope}\nQuestion: {question}"
+    try:
+        raw = _chat_with_retries(
+            config=config,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            options={"temperature": 0.0, "num_ctx": 1024, "num_predict": 80},
+            max_attempts=1,
+            on_status=None,
+            status_label="Planning...",
+        )
+    except Exception:
+        return None
+
+    data = _parse_json_dict(raw)
+    if not isinstance(data, dict):
+        return None
+    value = str(data.get("complexity", "") or "").strip().lower()
+    if value in {"simple", "medium", "hard"}:
+        return value
+    return None
+
+
 def _committee_active_models(
     *,
     scope: str,
     messages: list[dict[str, str]],
     models: list[str],
+    config: local_ollama.OllamaConfig | None = None,
 ) -> tuple[list[str], str]:
     if not models:
         return [], "simple"
@@ -719,7 +902,17 @@ def _committee_active_models(
     if not _env_flag("AGENT_MULTI_SMART", default=True):
         return models, "hard"
 
-    level = _committee_complexity_level(scope=scope, messages=messages)
+    # Keep simple requests fast: classify heuristically first and avoid extra planner calls when already simple.
+    heuristic_level = _committee_complexity_level(scope=scope, messages=messages)
+    level: str = heuristic_level
+    if (
+        heuristic_level != "simple"
+        and config is not None
+        and _env_flag("AGENT_MULTI_DISPATCH_LLM", default=True)
+    ):
+        llm_level = _committee_complexity_with_llm(scope=scope, messages=messages, config=config)
+        if llm_level is not None:
+            level = llm_level
     if level == "simple":
         target = _env_int("AGENT_MULTI_SIMPLE_MODELS", default=1)
     elif level == "medium":
@@ -731,6 +924,141 @@ def _committee_active_models(
     if target <= 0:
         return models, level
     return models[: max(1, min(len(models), target))], level
+
+
+def _committee_role_instruction(*, scope: str, role_index: int, role_count: int) -> tuple[str, str]:
+    # Assign complementary roles so models collaborate like a review group.
+    slots = [
+        (
+            "solver",
+            "Role: Solver. Draft a direct and complete answer.",
+        ),
+        (
+            "skeptic",
+            "Role: Skeptic. Challenge weak claims and remove speculation.",
+        ),
+        (
+            "grounding",
+            "Role: Grounding checker. Keep only facts supported by context/sources.",
+        ),
+        (
+            "editor",
+            "Role: Editor. Improve clarity, structure, and concision.",
+        ),
+    ]
+    name, brief = slots[role_index % len(slots)]
+    scope_hint = ""
+    if scope in {"research", "book"}:
+        scope_hint = " Scope focus: ensure every claim is source-grounded."
+    elif scope == "correct":
+        scope_hint = " Scope focus: preserve meaning and only correct language mistakes."
+    elif scope == "summarize":
+        scope_hint = " Scope focus: keep key points without adding new facts."
+    elif scope == "chat":
+        scope_hint = " Scope focus: keep the answer practical and straight to the point."
+
+    instruction = (
+        "You are part of a multi-model committee.\n"
+        f"{brief}{scope_hint}\n"
+        f"You are member {role_index + 1}/{max(1, role_count)}.\n"
+        "Return only your draft answer."
+    )
+    return name, instruction
+
+
+def _committee_peer_review(
+    *,
+    scope: str,
+    config: local_ollama.OllamaConfig,
+    candidates: list[dict[str, str]],
+    messages: list[dict[str, str]],
+    on_status: Callable[[str], None] | None = None,
+) -> tuple[list[int], str]:
+    if len(candidates) < 2 or not _env_flag("AGENT_MULTI_PEER_REVIEW", default=True):
+        return list(range(1, len(candidates) + 1)), ""
+
+    reviewer_limit = _env_int("AGENT_MULTI_REVIEWERS", default=0)
+    reviewers = list(candidates)
+    if reviewer_limit > 0:
+        reviewers = reviewers[: max(1, min(len(reviewers), reviewer_limit))]
+
+    context_text = _message_excerpt_for_committee(messages)
+    draft_blocks = "\n\n".join(
+        f"[{i}] role={cand['role']}\n{cand['answer'].strip()}"
+        for i, cand in enumerate(candidates, start=1)
+    )
+
+    scores: dict[int, float] = {i: 0.0 for i in range(1, len(candidates) + 1)}
+    votes: dict[int, int] = {i: 0 for i in range(1, len(candidates) + 1)}
+    notes: list[str] = []
+
+    for i, reviewer in enumerate(reviewers, start=1):
+        if on_status is not None:
+            on_status(f"Multi-agent: peer review {i}/{len(reviewers)}...")
+        reviewer_system = (
+            "You are a strict peer reviewer in a multi-model committee.\n"
+            "Evaluate draft answers and choose the best grounded draft.\n"
+            "Return ONLY JSON:\n"
+            '{"best_id": <int>, "scores": [{"id": <int>, "score": <0..10>}], "note": "..."}\n'
+            "Rules:\n"
+            "- Penalize unsupported claims.\n"
+            "- Prefer grounded, precise, and relevant drafts.\n"
+            "- Do not mention model names.\n"
+        )
+        reviewer_user = (
+            f"Scope: {scope}\n\n"
+            f"Conversation context:\n{context_text}\n\n"
+            f"Draft answers:\n{draft_blocks}\n\n"
+            f"Reviewer role: {reviewer['role']}"
+        )
+        reviewer_cfg = local_ollama.OllamaConfig(host=config.host, model=reviewer["model"], timeout_s=config.timeout_s)
+        try:
+            raw = _chat_with_retries(
+                config=reviewer_cfg,
+                messages=[{"role": "system", "content": reviewer_system}, {"role": "user", "content": reviewer_user}],
+                options={"temperature": 0.0, "num_ctx": 4096, "num_predict": 350},
+                max_attempts=2,
+                on_status=None,
+                status_label="Peer review...",
+            )
+            data = _parse_json_dict(raw)
+            if not isinstance(data, dict):
+                continue
+            try:
+                best_id = int(data.get("best_id"))
+            except Exception:
+                best_id = 0
+            if best_id in scores:
+                scores[best_id] += 2.0
+                votes[best_id] += 1
+
+            rows = data.get("scores")
+            if isinstance(rows, list):
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        draft_id = int(row.get("id"))
+                        row_score = float(row.get("score"))
+                    except Exception:
+                        continue
+                    if draft_id not in scores:
+                        continue
+                    row_score = max(0.0, min(10.0, row_score))
+                    scores[draft_id] += row_score / 10.0
+
+            note = str(data.get("note", "") or "").strip()
+            if note:
+                notes.append(note)
+        except Exception:
+            continue
+
+    ranking = sorted(scores.keys(), key=lambda idx: (scores[idx], votes[idx]), reverse=True)
+    summary = [f"[{idx}] score={scores[idx]:.2f} votes={votes[idx]}" for idx in ranking]
+    if notes:
+        summary.append("Review notes:")
+        summary.extend(f"- {n}" for n in notes[:3])
+    return ranking, "\n".join(summary)
 
 
 def _message_excerpt_for_committee(messages: list[dict[str, str]], *, max_messages: int = 8, max_chars: int = 1600) -> str:
@@ -747,6 +1075,48 @@ def _message_excerpt_for_committee(messages: list[dict[str, str]], *, max_messag
     return "\n\n".join(parts)
 
 
+def _second_look_review(
+    *,
+    question: str,
+    draft_answer: str,
+    config: local_ollama.OllamaConfig,
+    reviewer_model: str,
+) -> str | None:
+    reviewer_cfg = local_ollama.OllamaConfig(host=config.host, model=reviewer_model, timeout_s=config.timeout_s)
+    system = (
+        "You are a strict second-pass reviewer for factual chat answers.\n"
+        "Return ONLY JSON with this schema:\n"
+        '{"verdict":"ok|risky","revised_answer":"...","reason":"..."}\n'
+        "Rules:\n"
+        "- Mark verdict=risky if draft could be wrong, speculative, or overconfident.\n"
+        "- If risky, provide a safer revised answer.\n"
+        "- Prefer saying uncertainty clearly instead of inventing facts.\n"
+    )
+    user = f"Question:\n{question}\n\nDraft answer:\n{draft_answer}"
+    try:
+        raw = _chat_with_retries(
+            config=reviewer_cfg,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            options={"temperature": 0.0, "num_ctx": 2048, "num_predict": 220},
+            max_attempts=1,
+            on_status=None,
+            status_label="Second look...",
+        )
+    except Exception:
+        return None
+
+    data = _parse_json_dict(raw)
+    if not isinstance(data, dict):
+        return None
+    verdict = str(data.get("verdict", "") or "").strip().lower()
+    revised = str(data.get("revised_answer", "") or "").strip()
+    if verdict == "ok":
+        return None
+    if verdict in {"risky", "fail", "incorrect", "uncertain"} and revised:
+        return revised
+    return None
+
+
 def _chat_with_committee(
     *,
     scope: str,
@@ -758,15 +1128,36 @@ def _chat_with_committee(
 ) -> str:
     label = (status_label or "Thinking...").strip() or "Thinking..."
     all_models = _committee_models(config.model)
-    active_models, complexity = _committee_active_models(scope=scope, messages=messages, models=all_models)
+    active_models, complexity = _committee_active_models(scope=scope, messages=messages, models=all_models, config=config)
     if len(active_models) <= 1:
-        return _chat_with_retries(
+        primary_answer = _chat_with_retries(
             config=config,
             messages=messages,
             options=options,
             on_status=on_status,
             status_label=label,
         )
+        if scope == "chat" and _env_flag("AGENT_CHAT_SECOND_LOOK", default=True):
+            question = _extract_primary_question(scope=scope, text=_latest_user_text(messages))
+            needs_second_look = _looks_like_fact_lookup_query(question) or _looks_like_confidence_challenge(question)
+            if needs_second_look:
+                reviewer_model = ""
+                for candidate in all_models:
+                    if candidate != config.model:
+                        reviewer_model = candidate
+                        break
+                if reviewer_model:
+                    if on_status is not None:
+                        on_status("Second look: cross-checking answer...")
+                    revised = _second_look_review(
+                        question=question,
+                        draft_answer=primary_answer,
+                        config=config,
+                        reviewer_model=reviewer_model,
+                    )
+                    if revised:
+                        return revised
+        return primary_answer
 
     if on_status is not None:
         on_status(
@@ -796,28 +1187,46 @@ def _chat_with_committee(
     results_by_model: dict[str, str] = {}
     errors_by_model: dict[str, str] = {}
 
-    def _run_one(model_name: str) -> tuple[str, str | None, str | None]:
+    role_mode = _env_flag("AGENT_MULTI_ROLE_MODE", default=True)
+    role_assignments: list[tuple[str, str, str]] = []
+    for idx, model_name in enumerate(active_models):
+        if role_mode:
+            role_name, role_instruction = _committee_role_instruction(
+                scope=scope,
+                role_index=idx,
+                role_count=len(active_models),
+            )
+        else:
+            role_name = "generalist"
+            role_instruction = "You are part of a multi-model committee. Return only your draft answer."
+        role_assignments.append((model_name, role_name, role_instruction))
+
+    def _run_one(model_name: str, role_name: str, role_instruction: str) -> tuple[str, str, str | None, str | None]:
         model_config = local_ollama.OllamaConfig(host=config.host, model=model_name, timeout_s=config.timeout_s)
+        role_messages = [{"role": "system", "content": role_instruction}, *messages]
         try:
             text = _chat_with_retries(
                 config=model_config,
-                messages=messages,
+                messages=role_messages,
                 options=draft_options,
                 max_attempts=2,
                 on_status=None,
                 status_label=label,
             )
-            return model_name, text, None
+            return model_name, role_name, text, None
         except Exception as e:
-            return model_name, None, str(e)
+            return model_name, role_name, None, str(e)
 
     completed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(_run_one, model): model for model in active_models}
+        future_map = {
+            executor.submit(_run_one, model_name, role_name, role_instruction): (model_name, role_name)
+            for (model_name, role_name, role_instruction) in role_assignments
+        }
         for future in concurrent.futures.as_completed(future_map):
-            model_name = future_map[future]
+            model_name, role_name = future_map[future]
             try:
-                model_name, text, err = future.result()
+                model_name, role_name, text, err = future.result()
             except Exception as e:
                 text = None
                 err = str(e)
@@ -829,11 +1238,18 @@ def _chat_with_committee(
             if on_status is not None:
                 on_status(f"Multi-agent: group drafts ready {completed}/{len(active_models)}")
 
-    candidates: list[tuple[str, str]] = []
-    for model in active_models:
-        value = results_by_model.get(model)
+    role_by_model = {model_name: role_name for (model_name, role_name, _) in role_assignments}
+    candidates: list[dict[str, str]] = []
+    for model_name in active_models:
+        value = results_by_model.get(model_name)
         if value:
-            candidates.append((model, value))
+            candidates.append(
+                {
+                    "model": model_name,
+                    "role": role_by_model.get(model_name, "generalist"),
+                    "answer": value,
+                }
+            )
 
     if not candidates:
         # All worker drafts failed; fall back to primary model with regular retry logic.
@@ -846,7 +1262,23 @@ def _chat_with_committee(
         )
 
     if len(candidates) == 1:
-        return candidates[0][1]
+        return candidates[0]["answer"]
+
+    if on_status is not None:
+        on_status("Multi-agent: group review...")
+
+    ranking, review_summary = _committee_peer_review(
+        scope=scope,
+        config=config,
+        candidates=candidates,
+        messages=messages,
+        on_status=on_status,
+    )
+    if ranking:
+        by_id = {idx: cand for idx, cand in enumerate(candidates, start=1)}
+        reordered = [by_id[idx] for idx in ranking if idx in by_id]
+        if reordered:
+            candidates = reordered
 
     if on_status is not None:
         on_status("Multi-agent: group merge...")
@@ -867,8 +1299,8 @@ def _chat_with_committee(
 
     context_text = _message_excerpt_for_committee(messages)
     candidate_blocks = "\n\n".join(
-        f"[{idx}] model={model_name}\n{answer.strip()}"
-        for idx, (model_name, answer) in enumerate(candidates, start=1)
+        f"[{idx}] role={cand['role']}\n{cand['answer'].strip()}"
+        for idx, cand in enumerate(candidates, start=1)
     )
     merge_system = (
         "You are a lead assistant combining drafts from multiple local models.\n"
@@ -883,6 +1315,7 @@ def _chat_with_committee(
     merge_user = (
         f"Scope: {scope}\n\n"
         f"Conversation context:\n{context_text}\n\n"
+        f"Peer review summary:\n{review_summary or 'No peer review summary.'}\n\n"
         f"Draft answers:\n{candidate_blocks}"
     )
 
@@ -902,11 +1335,68 @@ def _chat_with_committee(
 
     # If merge fails, prefer primary-model draft when available.
     primary = config.model
-    for model_name, answer in candidates:
-        if model_name == primary:
-            return answer
+    for cand in candidates:
+        if cand["model"] == primary:
+            return cand["answer"]
     # Otherwise return the first successful draft.
-    return candidates[0][1]
+    return candidates[0]["answer"]
+
+
+def _accuracy_audit_answer(
+    *,
+    scope: str,
+    question: str,
+    draft_answer: str,
+    config: local_ollama.OllamaConfig,
+) -> str:
+    text = (draft_answer or "").strip()
+    if not text:
+        return draft_answer
+    if scope in {"correct", "research", "book"}:
+        return draft_answer
+
+    reviewer_model = config.model
+    for candidate in _committee_models(config.model):
+        if candidate != config.model:
+            reviewer_model = candidate
+            break
+    reviewer_cfg = local_ollama.OllamaConfig(host=config.host, model=reviewer_model, timeout_s=config.timeout_s)
+
+    system = (
+        "You are a strict answer-quality auditor.\n"
+        "Return ONLY JSON with this schema:\n"
+        '{"verdict":"ok|revise","revised_answer":"...","issues":["..."]}\n'
+        "Rules:\n"
+        "- Use revise if the draft has factual risk, weak grounding, contradiction, or does not answer the question.\n"
+        "- Prefer explicit uncertainty over fabricated details.\n"
+        "- Keep revised_answer concise and directly useful.\n"
+        "- If verdict is ok, revised_answer can be empty.\n"
+    )
+    user = (
+        f"Scope: {scope}\n\n"
+        f"Question:\n{question}\n\n"
+        f"Draft answer:\n{text}"
+    )
+    try:
+        raw = _chat_with_retries(
+            config=reviewer_cfg,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            options={"temperature": 0.0, "num_ctx": 2048, "num_predict": 280},
+            max_attempts=1,
+            on_status=None,
+            status_label="Auditing answer...",
+        )
+    except Exception:
+        return draft_answer
+
+    data = _parse_json_dict(raw)
+    if not isinstance(data, dict):
+        return draft_answer
+    verdict = str(data.get("verdict", "") or "").strip().lower()
+    revised = str(data.get("revised_answer", "") or "").strip()
+    if verdict == "revise" and revised:
+        return revised
+    return draft_answer
 
 
 def _generate_answer(
@@ -921,7 +1411,7 @@ def _generate_answer(
 ) -> str:
     label = (status_label or "Thinking...").strip() or "Thinking..."
     if not _committee_enabled_for(scope):
-        return _chat_with_retries(
+        answer = _chat_with_retries(
             config=config,
             messages=messages,
             options=options,
@@ -929,14 +1419,26 @@ def _generate_answer(
             on_status=on_status,
             status_label=label,
         )
-    return _chat_with_committee(
-        scope=scope,
-        config=config,
-        messages=messages,
-        options=options,
-        on_status=on_status,
-        status_label=label,
-    )
+    else:
+        answer = _chat_with_committee(
+            scope=scope,
+            config=config,
+            messages=messages,
+            options=options,
+            on_status=on_status,
+            status_label=label,
+        )
+
+    if _env_flag("AGENT_STRICT_ACCURACY", default=True):
+        question = _extract_primary_question(scope=scope, text=_latest_user_text(messages))
+        if question:
+            answer = _accuracy_audit_answer(
+                scope=scope,
+                question=question,
+                draft_answer=answer,
+                config=config,
+            )
+    return answer
 
 
 def correct_text(text: str, *, language: str, config: local_ollama.OllamaConfig) -> str:
@@ -1076,6 +1578,10 @@ def _looks_like_web_request(text: str) -> bool:
         return False
     if "http://" in t or "https://" in t:
         return True
+    if _looks_like_fact_lookup_query(t):
+        return True
+    if _looks_like_weather_query(t):
+        return True
     if "right now" in t:
         return True
     if re.search(r"\bto+day(s)?\b", t):
@@ -1098,6 +1604,8 @@ def _looks_like_web_request(text: str) -> bool:
             "updates",
             "happening",
             "live",
+            "forecast",
+            "temperature",
         ]
     ):
         return True
@@ -1460,28 +1968,21 @@ def _parse_json_dict(raw: str) -> dict[str, Any] | None:
     return None
 
 
-def _chat_memory_turns() -> int:
+def _session_memory_turns() -> int:
     try:
-        return max(1, min(30, int(os.getenv("AGENT_MEMORY_TURNS", "8"))))
+        return max(0, min(30, int(os.getenv("AGENT_MEMORY_TURNS", "8"))))
     except Exception:
         return 8
 
 
-def _chat_memory_max_chars() -> int:
+def _session_memory_max_chars() -> int:
     try:
         return max(200, min(8000, int(os.getenv("AGENT_MEMORY_MAX_CHARS", "2000"))))
     except Exception:
         return 2000
 
 
-def _chat_memory_file(*, out_dir: str) -> Path:
-    configured = os.getenv("AGENT_MEMORY_FILE", "").strip()
-    if configured:
-        return Path(configured)
-    return Path(out_dir) / ".agent_memory.json"
-
-
-def _trim_chat_memory(messages: list[dict[str, str]], *, max_turns: int) -> list[dict[str, str]]:
+def _trim_session_memory(messages: list[dict[str, str]], *, max_turns: int) -> list[dict[str, str]]:
     max_items = max(0, int(max_turns) * 2)
     if max_items <= 0:
         return []
@@ -1490,7 +1991,7 @@ def _trim_chat_memory(messages: list[dict[str, str]], *, max_turns: int) -> list
     return messages[-max_items:]
 
 
-def _clip_memory_text(text: str, *, max_chars: int) -> str:
+def _clip_session_memory_text(text: str, *, max_chars: int) -> str:
     value = (text or "").strip()
     if len(value) <= max_chars:
         return value
@@ -1499,40 +2000,7 @@ def _clip_memory_text(text: str, *, max_chars: int) -> str:
     return value[:keep].rstrip() + tail
 
 
-def _load_chat_memory(path: Path, *, max_turns: int) -> list[dict[str, str]]:
-    try:
-        if not path.exists():
-            return []
-        raw = path.read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except Exception:
-        return []
-
-    if not isinstance(data, list):
-        return []
-
-    out: list[dict[str, str]] = []
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        role = str(item.get("role", "")).strip().lower()
-        content = str(item.get("content", "")).strip()
-        if role not in {"user", "assistant"} or not content:
-            continue
-        out.append({"role": role, "content": content})
-
-    return _trim_chat_memory(out, max_turns=max_turns)
-
-
-def _save_chat_memory(path: Path, *, messages: list[dict[str, str]]) -> None:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        return
-
-
-def _append_chat_memory(
+def _append_session_memory(
     memory: list[dict[str, str]],
     *,
     user_text: str,
@@ -1540,15 +2008,18 @@ def _append_chat_memory(
     max_turns: int,
     max_chars: int,
 ) -> None:
-    user_clean = _clip_memory_text(user_text, max_chars=max_chars)
-    assistant_clean = _clip_memory_text(assistant_text, max_chars=max_chars)
+    if max_turns <= 0:
+        memory.clear()
+        return
+    user_clean = _clip_session_memory_text(user_text, max_chars=max_chars)
+    assistant_clean = _clip_session_memory_text(assistant_text, max_chars=max_chars)
 
     if user_clean:
         memory.append({"role": "user", "content": user_clean})
     if assistant_clean:
         memory.append({"role": "assistant", "content": assistant_clean})
 
-    trimmed = _trim_chat_memory(memory, max_turns=max_turns)
+    trimmed = _trim_session_memory(memory, max_turns=max_turns)
     if trimmed is not memory:
         memory[:] = trimmed
 
@@ -1888,6 +2359,117 @@ def _verify_grounded_answer(
     return draft_answer
 
 
+def _query_terms(query: str) -> list[str]:
+    normalized = _normalize_for_lang_detection(query or "")
+    terms = [t.lower() for t in re.findall(r"[a-z0-9]{3,}", normalized)]
+    # Keep original order while deduplicating repeated terms.
+    return list(dict.fromkeys(terms))
+
+
+def _score_result_relevance(*, query: str, title: str, snippet: str, url: str) -> int:
+    terms = _query_terms(query)
+    if not terms:
+        return 0
+    t = _normalize_for_lang_detection(title or "")
+    s = _normalize_for_lang_detection(snippet or "")
+    u = _normalize_for_lang_detection(url or "")
+    score = 0
+    for term in terms:
+        if term in t:
+            score += 4
+        if term in s:
+            score += 2
+        if term in u:
+            score += 1
+    return score
+
+
+def _normalize_search_results(results: list[object], *, query: str, max_results: int) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    max_results = max(1, min(int(max_results), 20))
+    for idx, item in enumerate(results):
+        if isinstance(item, dict):
+            raw_url = str(item.get("url", "") or "").strip()
+            raw_title = str(item.get("title", "") or "").strip()
+            raw_snippet = str(item.get("snippet", "") or "").strip()
+        else:
+            raw_url = str(item or "").strip()
+            raw_title = ""
+            raw_snippet = ""
+        if not raw_url:
+            continue
+        key = raw_url.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        score = _score_result_relevance(query=query, title=raw_title, snippet=raw_snippet, url=raw_url)
+        out.append(
+            {
+                "url": raw_url,
+                "title": raw_title,
+                "snippet": raw_snippet,
+                "score": str(score),
+                "order": str(idx),
+            }
+        )
+    out.sort(key=lambda r: (-int(r.get("score", "0")), int(r.get("order", "0"))))
+    return out[:max_results]
+
+
+def _extract_relevant_source_excerpt(*, text: str, query: str, max_chars: int) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    max_chars = max(500, int(max_chars))
+    trimmed_full = raw[:max_chars].rstrip()
+    if len(trimmed_full) < len(raw):
+        trimmed_full += "..."
+
+    terms = _query_terms(query)
+    if not terms:
+        return trimmed_full
+
+    blocks = [p.strip() for p in re.split(r"\n\s*\n+", raw) if p and p.strip()]
+    if len(blocks) <= 1:
+        blocks = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if not blocks:
+        return trimmed_full
+
+    scored: list[tuple[int, int, str]] = []
+    for idx, block in enumerate(blocks):
+        low = _normalize_for_lang_detection(block)
+        score = sum(1 for term in terms if term in low)
+        if score > 0:
+            scored.append((score, idx, block))
+
+    if not scored:
+        return trimmed_full
+
+    scored.sort(key=lambda row: (-row[0], row[1]))
+    chosen: list[tuple[int, str]] = []
+    total_chars = 0
+    for _, idx, block in scored:
+        block_len = len(block)
+        if chosen and total_chars + block_len > max_chars:
+            continue
+        chosen.append((idx, block))
+        total_chars += block_len + 2
+        if total_chars >= max_chars or len(chosen) >= 10:
+            break
+
+    if not chosen:
+        return trimmed_full
+
+    chosen.sort(key=lambda row: row[0])
+    excerpt = "\n\n".join(block for _, block in chosen).strip()
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[:max_chars].rstrip() + "..."
+    if len(excerpt) < min(240, max_chars // 5):
+        return trimmed_full
+    return excerpt
+
+
 async def research_answer(
     query: str,
     *,
@@ -1900,41 +2482,47 @@ async def research_answer(
     seed_urls: list[str] | None = None,
     on_status: Callable[[str], None] | None = None,
 ) -> tuple[str, list[str]]:
+    query = (query or "").strip()
+    if not query:
+        return ("Query is empty.", [])
     max_results = max(1, min(int(max_results), 10))
     max_sources = max(1, min(int(max_sources), max_results))
+    max_chars_per_source = max(800, min(int(max_chars_per_source), 12_000))
+
+    fast_lookup = _looks_like_simple_research_lookup(query)
+    weather_lookup = _looks_like_weather_query(query)
+    if fast_lookup:
+        fast_sources = max(1, min(4, _env_int("AGENT_FAST_RESEARCH_MAX_SOURCES", default=2)))
+        fast_chars = max(800, min(8_000, _env_int("AGENT_FAST_RESEARCH_MAX_CHARS", default=2800)))
+        max_sources = min(max_sources, fast_sources)
+        max_chars_per_source = min(max_chars_per_source, fast_chars)
 
     import web_tools
+
+    def normalize_one_url(url: str) -> str | None:
+        u = (url or "").strip()
+        if not u:
+            return None
+        try:
+            return web_tools.ensure_https_url(u)
+        except Exception:
+            return None
 
     def normalize_urls(urls: list[str]) -> list[str]:
         out: list[str] = []
         seen: set[str] = set()
         for u in urls:
-            u = (u or "").strip()
-            if not u:
+            normalized = normalize_one_url(u)
+            if not normalized:
                 continue
-            try:
-                u = web_tools.ensure_https_url(u)
-            except Exception:
+            if normalized in seen:
                 continue
-            if u in seen:
-                continue
-            seen.add(u)
-            out.append(u)
+            seen.add(normalized)
+            out.append(normalized)
         return out
 
-    def urls_from_results(results: list[object]) -> list[str]:
-        urls: list[str] = []
-        for item in results:
-            if isinstance(item, dict):
-                url = item.get("url")
-            else:
-                url = item
-            if url is None:
-                continue
-            urls.append(str(url))
-        return urls
-
     candidate_urls: list[str] = []
+    search_meta_by_url: dict[str, dict[str, str]] = {}
     if seed_urls:
         candidate_urls = normalize_urls(seed_urls)
 
@@ -1957,7 +2545,24 @@ async def research_answer(
                         on_status("Searching web...")
                     results_json = await client.call_tool("web_search", {"query": query, "max_results": max_results})
                     results = json.loads(results_json) if results_json else []
-                    candidate_urls = normalize_urls(urls_from_results(results if isinstance(results, list) else []))
+                    normalized_results = _normalize_search_results(
+                        results if isinstance(results, list) else [],
+                        query=query,
+                        max_results=max_results,
+                    )
+                    ranked_urls: list[str] = []
+                    for row in normalized_results:
+                        normalized = normalize_one_url(str(row.get("url", "") or ""))
+                        if not normalized:
+                            continue
+                        if normalized in search_meta_by_url:
+                            continue
+                        search_meta_by_url[normalized] = {
+                            "title": str(row.get("title", "") or "").strip(),
+                            "snippet": str(row.get("snippet", "") or "").strip(),
+                        }
+                        ranked_urls.append(normalized)
+                    candidate_urls = ranked_urls
 
                 for url in candidate_urls:
                     if len(sources) >= max_sources:
@@ -1966,7 +2571,12 @@ async def research_answer(
                         if on_status:
                             on_status(f"Fetching {len(sources)+1}/{max_sources}: {url}")
                         text = await client.call_tool("fetch_url", {"url": url, "max_chars": max_chars_per_source})
-                        sources.append((url, text or ""))
+                        focused_text = _extract_relevant_source_excerpt(
+                            text=text or "",
+                            query=query,
+                            max_chars=max_chars_per_source,
+                        )
+                        sources.append((url, focused_text))
                     except Exception as e:
                         last_error = str(e)
                         continue
@@ -1980,21 +2590,59 @@ async def research_answer(
                 if on_status:
                     on_status("Searching web...")
                 results = web_tools.web_search(query, max_results=max_results)
-                candidate_urls = normalize_urls(urls_from_results(results))
+                normalized_results = _normalize_search_results(results, query=query, max_results=max_results)
+                ranked_urls: list[str] = []
+                for row in normalized_results:
+                    normalized = normalize_one_url(str(row.get("url", "") or ""))
+                    if not normalized:
+                        continue
+                    if normalized in search_meta_by_url:
+                        continue
+                    search_meta_by_url[normalized] = {
+                        "title": str(row.get("title", "") or "").strip(),
+                        "snippet": str(row.get("snippet", "") or "").strip(),
+                    }
+                    ranked_urls.append(normalized)
+                candidate_urls = ranked_urls
             except Exception as e:
                 last_error = str(e)
                 candidate_urls = []
 
-        for url in candidate_urls:
-            if len(sources) >= max_sources:
-                break
+        fetch_candidates = list(candidate_urls[: max(max_sources * 3, max_sources)])
+        if fetch_candidates:
+            if on_status:
+                on_status("Fetching pages in parallel...")
+
+            async def _fetch_one(url: str) -> tuple[str, str | None, str | None]:
+                try:
+                    fetched = await asyncio.to_thread(web_tools.fetch_url, url, max_chars=max_chars_per_source)
+                    focused = _extract_relevant_source_excerpt(
+                        text=fetched,
+                        query=query,
+                        max_chars=max_chars_per_source,
+                    )
+                    return url, focused, None
+                except Exception as e:
+                    return url, None, str(e)
+
+            tasks = [asyncio.create_task(_fetch_one(url)) for url in fetch_candidates]
             try:
-                if on_status:
-                    on_status(f"Fetching {len(sources)+1}/{max_sources}: {url}")
-                sources.append((url, web_tools.fetch_url(url, max_chars=max_chars_per_source)))
-            except Exception as e:
-                last_error = str(e)
-                continue
+                for task in asyncio.as_completed(tasks):
+                    url, text, err = await task
+                    if text:
+                        sources.append((url, text))
+                        if on_status:
+                            on_status(f"Fetched {len(sources)}/{max_sources}: {url}")
+                        if len(sources) >= max_sources:
+                            break
+                    elif err:
+                        last_error = err
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
     if not sources:
         if not candidate_urls:
@@ -2012,25 +2660,38 @@ async def research_answer(
     source_urls: list[str] = []
     for i, (url, text) in enumerate(sources, start=1):
         source_urls.append(url)
-        source_blocks.append(f"[{i}] URL: {url}\n{text}")
+        meta = search_meta_by_url.get(url, {})
+        title = str(meta.get("title", "") or "").strip()
+        snippet = str(meta.get("snippet", "") or "").strip()
+        header_parts = [f"[{i}] URL: {url}"]
+        if title:
+            header_parts.append(f"Title: {title}")
+        if snippet:
+            header_parts.append(f"Snippet: {snippet}")
+        source_blocks.append("\n".join(header_parts) + f"\n{text}")
 
-    system = (
-        "You are a research assistant. "
-        "Answer using ONLY the sources provided. "
-        "Read source content carefully before answering. "
-        "For code sources, describe concrete functions, imports, and behavior from the code. "
-        "If sources are insufficient, say what is missing. "
-        "Cite sources as [1], [2], etc."
-    )
+    system_parts = [
+        "You are a research assistant.",
+        "Answer using ONLY the sources provided.",
+        "Read source content carefully before answering.",
+        "For code sources, describe concrete functions, imports, and behavior from the code.",
+        "If sources are insufficient, say what is missing.",
+        "Cite sources as [1], [2], etc.",
+    ]
+    if weather_lookup:
+        system_parts.append("For weather questions, return weather details only and ignore unrelated side content.")
+    system = " ".join(system_parts)
     user = f"Question: {query}\n\nSources:\n\n" + "\n\n".join(source_blocks)
 
     if on_status:
         on_status("Writing answer...")
+    answer_num_predict = max(220, min(900, _env_int("AGENT_FAST_RESEARCH_NUM_PREDICT", default=500))) if fast_lookup else 1200
+    answer_temperature = 0.1 if fast_lookup else 0.2
     answer = _generate_answer(
         scope="research",
         config=config,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        options={"temperature": 0.2, "num_ctx": 4096, "num_predict": 1200},
+        options={"temperature": answer_temperature, "num_ctx": 4096, "num_predict": answer_num_predict},
         on_status=on_status,
         status_label="Writing answer...",
     )
@@ -2409,15 +3070,10 @@ async def cmd_chat(args: argparse.Namespace) -> int:
     _setup_line_editing()
     active_book: str | None = None
     active_index: rag.RAGIndex | None = None
-    memory_turns = _chat_memory_turns()
-    memory_max_chars = _chat_memory_max_chars()
-    memory_path = _chat_memory_file(out_dir=out_dir)
-    chat_memory = _load_chat_memory(memory_path, max_turns=memory_turns)
+    memory_turns = _session_memory_turns()
+    memory_max_chars = _session_memory_max_chars()
+    chat_memory: list[dict[str, str]] = []
     last_assistant_reply = ""
-    for item in reversed(chat_memory):
-        if item.get("role") == "assistant":
-            last_assistant_reply = item.get("content", "")
-            break
 
     def _remember_exchange(user_text: str, assistant_text: str) -> None:
         nonlocal last_assistant_reply
@@ -2425,14 +3081,13 @@ async def cmd_chat(args: argparse.Namespace) -> int:
         if not assistant:
             return
         last_assistant_reply = assistant
-        _append_chat_memory(
+        _append_session_memory(
             chat_memory,
             user_text=user_text,
             assistant_text=assistant,
             max_turns=memory_turns,
             max_chars=memory_max_chars,
         )
-        _save_chat_memory(memory_path, messages=chat_memory)
 
     def _phase_note(msg: str) -> None:
         ui.print_plain(msg, extra_newline=False)
@@ -2472,8 +3127,8 @@ async def cmd_chat(args: argparse.Namespace) -> int:
                 "- /chat <message>            Force normal chat (ignore book mode)\n"
                 "- /research <query>          Force web research\n"
                 "- /quality [on|off]          Toggle verification/quality controls\n"
-                "- /memory                    Show memory status\n"
-                "- /memory clear              Clear saved conversation memory\n",
+                "- /memory                    Show session memory status\n"
+                "- /memory clear              Clear current session memory\n",
                 extra_newline=True,
             )
             continue
@@ -2508,10 +3163,13 @@ async def cmd_chat(args: argparse.Namespace) -> int:
 
         if line == "/memory":
             turns = len(chat_memory) // 2
-            ui.print_plain(
-                f"Memory: {turns} turn(s), max {memory_turns}. File: {memory_path}",
-                extra_newline=True,
-            )
+            if memory_turns <= 0:
+                ui.print_plain("Session memory: off (AGENT_MEMORY_TURNS=0).", extra_newline=True)
+            else:
+                ui.print_plain(
+                    f"Session memory: {turns} turn(s), max {memory_turns}. RAM only (cleared on exit).",
+                    extra_newline=True,
+                )
             continue
 
         if line.startswith("/memory "):
@@ -2521,12 +3179,7 @@ async def cmd_chat(args: argparse.Namespace) -> int:
                 continue
             chat_memory.clear()
             last_assistant_reply = ""
-            try:
-                if memory_path.exists():
-                    memory_path.unlink()
-            except Exception:
-                pass
-            ui.print_plain("Conversation memory cleared.", extra_newline=True)
+            ui.print_plain("Session memory cleared.", extra_newline=True)
             continue
 
         if line.startswith("/book "):
@@ -2602,7 +3255,7 @@ async def cmd_chat(args: argparse.Namespace) -> int:
 
         if line.startswith("/chat "):
             payload = line.split(" ", 1)[1].strip()
-            system = "You are a helpful assistant. Keep answers concise and practical."
+            system = _CHAT_SYSTEM_PROMPT
             _announce_mode(ui, "chat", "general answer")
             messages = [{"role": "system", "content": system}, *chat_memory, {"role": "user", "content": payload}]
             with ui.status("Thinking...") as status:
@@ -2610,7 +3263,7 @@ async def cmd_chat(args: argparse.Namespace) -> int:
                     scope="chat",
                     config=config,
                     messages=messages,
-                    options={"temperature": 0.4, "num_ctx": 4096, "num_predict": 800},
+                    options={"temperature": 0.2, "num_ctx": 4096, "num_predict": 800},
                     on_status=ui.status_callback(status),
                     status_label="Thinking...",
                 )
@@ -2870,7 +3523,7 @@ async def cmd_chat(args: argparse.Namespace) -> int:
             continue
 
         # chat
-        system = "You are a helpful assistant. Keep answers concise and practical."
+        system = _CHAT_SYSTEM_PROMPT
         prompt = (route.get("text") or "").strip() or line
         _announce_mode(ui, "chat", "general answer")
         messages = [{"role": "system", "content": system}, *chat_memory, {"role": "user", "content": prompt}]
@@ -2879,7 +3532,7 @@ async def cmd_chat(args: argparse.Namespace) -> int:
                 scope="chat",
                 config=config,
                 messages=messages,
-                options={"temperature": 0.4, "num_ctx": 4096, "num_predict": 800},
+                options={"temperature": 0.2, "num_ctx": 4096, "num_predict": 800},
                 on_status=ui.status_callback(status),
                 status_label="Thinking...",
             )

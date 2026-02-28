@@ -91,6 +91,12 @@ services:
       AGENT_MULTI_SIMPLE_MODELS: ${AGENT_MULTI_SIMPLE_MODELS:-1}
       AGENT_MULTI_MEDIUM_MODELS: ${AGENT_MULTI_MEDIUM_MODELS:-2}
       AGENT_MULTI_HARD_MODELS: ${AGENT_MULTI_HARD_MODELS:-0}
+      # Role-based drafting (solver/skeptic/grounding/editor).
+      AGENT_MULTI_ROLE_MODE: ${AGENT_MULTI_ROLE_MODE:-on}
+      # Peer review between model drafts before final merge.
+      AGENT_MULTI_PEER_REVIEW: ${AGENT_MULTI_PEER_REVIEW:-on}
+      # Number of reviewer models (0 = all selected models).
+      AGENT_MULTI_REVIEWERS: ${AGENT_MULTI_REVIEWERS:-0}
       # Parallel worker cap for drafting stage (0 uses all configured models).
       AGENT_MULTI_MAX_WORKERS: ${AGENT_MULTI_MAX_WORKERS:-0}
       # Default draft temperature when model options do not set one.
