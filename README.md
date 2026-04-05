@@ -21,17 +21,17 @@ copy .env.example .env
 Edit `.env` and set at least:
 
 ```env
-OLLAMA_MODEL=gemma3:1b
+OLLAMA_MODEL=qwen3:1.7b
 OCR_SPACE_API_KEY=your_key_here
 ```
 
-`OLLAMA_MODEL` is only an example. You can use another local model tag such as `gemma3:4b` if your hardware supports it. By default, size capping is disabled (`OLLAMA_MAX_B=0`).
+`OLLAMA_MODEL` is only an example. You can use another local model tag if your hardware supports it. By default, size capping is disabled (`OLLAMA_MAX_B=0`).
 
 If your machine is limited, use single-model mode instead of committee mode:
 
 ```env
-AGENT_MULTI_AGENT=off
-OLLAMA_MODEL=gemma3:1b
+AGENT_MULTI_AGENT=on
+OLLAMA_MODEL=qwen3:1.7b
 ```
 
 Start the assistant:
@@ -93,7 +93,7 @@ You can combine several small local models so the agent answers as a group, not 
 
 ```env
 AGENT_MULTI_AGENT=on
-AGENT_MULTI_MODELS=gemma3:1b,llama3.2:3b,qwen2.5:1.5b
+AGENT_MULTI_MODELS=qwen3:1.7b,llama3.2:3b,gemma3:4b
 AGENT_MULTI_SCOPES=chat,research,book,summarize,correct
 AGENT_MULTI_SMART=on
 AGENT_STRICT_ACCURACY=on

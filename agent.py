@@ -854,7 +854,7 @@ def _committee_complexity_with_llm(
     messages: list[dict[str, str]],
     config: local_ollama.OllamaConfig,
 ) -> str | None:
-    if scope not in {"research", "book"}:
+    if scope not in {"research", "book", "chat"}:
         return None
     question = _extract_primary_question(scope=scope, text=_latest_user_text(messages))
     if not question:
@@ -923,7 +923,15 @@ def _committee_active_models(
     # Zero/negative means "use all configured models".
     if target <= 0:
         return models, level
-    return models[: max(1, min(len(models), target))], level
+    count = max(1, min(len(models), target))
+    if count >= len(models):
+        return models, level
+    # Rotate selection so different models get used across requests instead
+    # of always picking the first N.
+    question = _latest_user_text(messages)
+    offset = hash(question) % len(models)
+    rotated = models[offset:] + models[:offset]
+    return rotated[:count], level
 
 
 def _committee_role_instruction(*, scope: str, role_index: int, role_count: int) -> tuple[str, str]:
@@ -992,19 +1000,18 @@ def _committee_peer_review(
     votes: dict[int, int] = {i: 0 for i in range(1, len(candidates) + 1)}
     notes: list[str] = []
 
-    for i, reviewer in enumerate(reviewers, start=1):
-        if on_status is not None:
-            on_status(f"Multi-agent: peer review {i}/{len(reviewers)}...")
-        reviewer_system = (
-            "You are a strict peer reviewer in a multi-model committee.\n"
-            "Evaluate draft answers and choose the best grounded draft.\n"
-            "Return ONLY JSON:\n"
-            '{"best_id": <int>, "scores": [{"id": <int>, "score": <0..10>}], "note": "..."}\n'
-            "Rules:\n"
-            "- Penalize unsupported claims.\n"
-            "- Prefer grounded, precise, and relevant drafts.\n"
-            "- Do not mention model names.\n"
-        )
+    reviewer_system = (
+        "You are a strict peer reviewer in a multi-model committee.\n"
+        "Evaluate draft answers and choose the best grounded draft.\n"
+        "Return ONLY JSON:\n"
+        '{"best_id": <int>, "scores": [{"id": <int>, "score": <0..10>}], "note": "..."}\n'
+        "Rules:\n"
+        "- Penalize unsupported claims.\n"
+        "- Prefer grounded, precise, and relevant drafts.\n"
+        "- Do not mention model names.\n"
+    )
+
+    def _run_review(reviewer: dict[str, str]) -> dict[str, Any] | None:
         reviewer_user = (
             f"Scope: {scope}\n\n"
             f"Conversation context:\n{context_text}\n\n"
@@ -1021,7 +1028,21 @@ def _committee_peer_review(
                 on_status=None,
                 status_label="Peer review...",
             )
-            data = _parse_json_dict(raw)
+            return _parse_json_dict(raw)
+        except Exception:
+            return None
+
+    if on_status is not None:
+        on_status(f"Multi-agent: peer review ({len(reviewers)} reviewers)...")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(reviewers)) as executor:
+        futures = {executor.submit(_run_review, r): r for r in reviewers}
+        completed_reviews = 0
+        for future in concurrent.futures.as_completed(futures):
+            completed_reviews += 1
+            if on_status is not None:
+                on_status(f"Multi-agent: peer review {completed_reviews}/{len(reviewers)}...")
+            data = future.result()
             if not isinstance(data, dict):
                 continue
             try:
@@ -1050,8 +1071,6 @@ def _committee_peer_review(
             note = str(data.get("note", "") or "").strip()
             if note:
                 notes.append(note)
-        except Exception:
-            continue
 
     ranking = sorted(scores.keys(), key=lambda idx: (scores[idx], votes[idx]), reverse=True)
     summary = [f"[{idx}] score={scores[idx]:.2f} votes={votes[idx]}" for idx in ranking]
@@ -1264,21 +1283,25 @@ def _chat_with_committee(
     if len(candidates) == 1:
         return candidates[0]["answer"]
 
-    if on_status is not None:
-        on_status("Multi-agent: group review...")
+    # With only 2 candidates peer review adds latency without much
+    # discriminative signal — skip straight to the merge step.
+    review_summary = ""
+    if len(candidates) > 2:
+        if on_status is not None:
+            on_status("Multi-agent: group review...")
 
-    ranking, review_summary = _committee_peer_review(
-        scope=scope,
-        config=config,
-        candidates=candidates,
-        messages=messages,
-        on_status=on_status,
-    )
-    if ranking:
-        by_id = {idx: cand for idx, cand in enumerate(candidates, start=1)}
-        reordered = [by_id[idx] for idx in ranking if idx in by_id]
-        if reordered:
-            candidates = reordered
+        ranking, review_summary = _committee_peer_review(
+            scope=scope,
+            config=config,
+            candidates=candidates,
+            messages=messages,
+            on_status=on_status,
+        )
+        if ranking:
+            by_id = {idx: cand for idx, cand in enumerate(candidates, start=1)}
+            reordered = [by_id[idx] for idx in ranking if idx in by_id]
+            if reordered:
+                candidates = reordered
 
     if on_status is not None:
         on_status("Multi-agent: group merge...")
@@ -1586,29 +1609,33 @@ def _looks_like_web_request(text: str) -> bool:
         return True
     if re.search(r"\bto+day(s)?\b", t):
         return True
-    if any(
-        k in t
-        for k in [
-            "search",
-            "look up",
-            "find sources",
-            "sources",
-            "citations",
-            "links",
-            "latest",
-            "news",
-            "today",
-            "current",
-            "recent",
-            "update",
-            "updates",
-            "happening",
-            "live",
-            "forecast",
-            "temperature",
-        ]
-    ):
+    # Strong web-intent keywords (unambiguous).
+    strong_web = (
+        "search",
+        "look up",
+        "find sources",
+        "sources",
+        "citations",
+        "links",
+        "latest",
+        "news",
+        "happening",
+        "forecast",
+    )
+    if any(k in t for k in strong_web):
         return True
+    # Ambiguous keywords — only count them as web intent when they appear
+    # in an information-seeking context (questions / short prompts), not in
+    # imperative/action sentences like "update the config".
+    ambiguous_web = ("current", "recent", "update", "updates", "live", "temperature")
+    if any(k in t for k in ambiguous_web):
+        token_count = len(re.findall(r"\w+", t))
+        looks_imperative = re.search(
+            r"\b(change|modify|set|edit|fix|configure|install|remove|delete|create|write|make|add|open|close|run|stop|start)\b",
+            t,
+        )
+        if not looks_imperative and (token_count <= 20 or t.rstrip().endswith("?")):
+            return True
     return False
 
 
@@ -1680,45 +1707,56 @@ def _decide_mode_for_prompt(
 ) -> tuple[str, dict[str, str]]:
     """
     Decide one execution mode: web|book|chat|correct|summarize.
+
+    Decision tree (evaluated once per call, no redundant checks):
+    1. Fast regex intent → correct / summarize / research (no LLM needed)
+    2. Book-mode short-circuits → web / book (avoid LLM call)
+    3. LLM router → validated action
+    4. Book-mode post-LLM fallback → book for substantive questions
     """
     base_route = {"action": "chat", "language": "auto", "length": "short", "text": prompt, "query": prompt}
+
+    # --- fast regex path (no LLM) ---
     intent = _simple_intent(prompt)
     if intent in {"correct", "summarize"}:
         return intent, {**base_route, "action": intent}
-    if intent == "research":
+
+    # Compute web/book/small-talk signals once and reuse them.
+    is_web = intent == "research" or _looks_like_web_request(prompt)
+    is_book_hint = _looks_like_book_request(prompt) if has_active_book else False
+    is_small_talk = _looks_like_small_talk(prompt)
+
+    if is_web and not has_active_book:
         return "web", {**base_route, "action": "research"}
 
-    # In active book mode, default to book for substantive questions.
-    # This avoids unnecessary router LLM calls (faster + visible behavior).
+    # --- book-mode short-circuits (skip LLM when the intent is clear) ---
     if has_active_book:
-        if _looks_like_web_request(prompt):
+        if is_web and not is_book_hint:
             return "web", {**base_route, "action": "research"}
-        if _looks_like_book_request(prompt):
+        if is_book_hint:
             return "book", base_route
-        if not _looks_like_small_talk(prompt):
+        if not is_small_talk and not is_web:
             return "book", base_route
 
+    # --- LLM router (only reached when heuristics are inconclusive) ---
     if on_status:
         on_status("Understanding request...")
     route = _route_with_llm(prompt, config=config, on_status=on_status)
-    action = route.get("action", "chat")
+    action = str(route.get("action", "chat")).strip().lower()
     if action not in {"correct", "summarize", "research", "chat"}:
         action = "chat"
         route = {**base_route, "action": "chat"}
 
-    # Prevent accidental web usage when no clear web need.
-    if action == "research" and not _looks_like_web_request(prompt):
+    # Trust the LLM's "research" only when the heuristic also sees web signals.
+    if action == "research" and not is_web:
         action = "chat"
         route = {**route, "action": "chat"}
 
+    # --- book-mode post-LLM fallback ---
     if has_active_book:
-        if _looks_like_web_request(prompt):
-            return "web", {**route, "action": "research"}
         if action in {"correct", "summarize"}:
             return action, route
-        if _looks_like_book_request(prompt):
-            return "book", route
-        if action == "chat" and not _looks_like_small_talk(prompt):
+        if not is_small_talk:
             return "book", route
 
     if action == "research":
@@ -2148,35 +2186,6 @@ def _answer_mentions_supported_name(answer: str, source_blocks: list[str]) -> bo
             return True
     return False
 
-
-def _question_keywords(question: str) -> list[str]:
-    _ = question
-    return []
-
-
-def _best_person_from_sources(question: str, source_blocks: list[str]) -> tuple[str | None, int | None]:
-    _ = question
-    _ = source_blocks
-    return None, None
-
-
-def _fallback_supported_person_answer(question: str, source_blocks: list[str]) -> str | None:
-    _ = question
-    _ = source_blocks
-    return None
-    # Conservative fallback: avoid overconfident guesses.
-    # If the heuristic picked an obvious investigator/profession title, skip it.
-    low_name = _normalize_match_text(name)
-    if any(low_name.startswith(prefix) for prefix in ("dr ", "docteur ", "judge ", "juge ")):
-        return None
-    lang = _infer_prompt_language(question)
-    if lang == "fr":
-        if ref is not None:
-            return f"D’après les extraits fournis, la réponse la mieux étayée est : {name} [{ref}]."
-        return f"D’après les extraits fournis, la réponse la mieux étayée est : {name}."
-    if ref is not None:
-        return f"Based on the provided excerpts, the best-supported answer is: {name} [{ref}]."
-    return f"Based on the provided excerpts, the best-supported answer is: {name}."
 
 
 def _resolve_who_answer_with_sources(
@@ -3541,9 +3550,9 @@ async def cmd_chat(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Local Ollama agent (Gemma3 1B/4B) with web tools.")
+    p = argparse.ArgumentParser(description="Local Ollama agent with web tools.")
     p.add_argument("--host", help="Ollama host (default: env OLLAMA_HOST or http://localhost:11434)")
-    p.add_argument("--model", help="Model tag (default: env OLLAMA_MODEL or gemma3:1b)")
+    p.add_argument("--model", help="Model tag (default: env OLLAMA_MODEL or qwen3:1.7b)")
     p.add_argument("--timeout-s", type=float, help="Ollama request timeout seconds (default: env OLLAMA_TIMEOUT_S)")
 
     sub = p.add_subparsers(dest="cmd")

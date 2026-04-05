@@ -38,10 +38,6 @@ def validate_model(model: str, *, max_b: int = 4) -> str:
     return model
 
 
-def validate_gemma3_model(model: str, *, max_b: int = 4) -> str:
-    # Backward-compatible alias for previous code paths.
-    return validate_model(model, max_b=max_b)
-
 
 def _normalize_host(host: str) -> str:
     # Normalize host and provide a default local endpoint.
@@ -65,7 +61,7 @@ class OllamaConfig:
     def from_env() -> "OllamaConfig":
         # Read host/model/timeout from environment with safe defaults.
         host = _normalize_host(os.getenv("OLLAMA_HOST", "http://localhost:11434"))
-        model = os.getenv("OLLAMA_MODEL", "gemma3:1b")
+        model = os.getenv("OLLAMA_MODEL", "qwen3:1.7b")
         # Apply configured model-size cap (0 disables cap).
         model = validate_model(model, max_b=int(os.getenv("OLLAMA_MAX_B", "4")))
         timeout_s = float(os.getenv("OLLAMA_TIMEOUT_S", "120"))
