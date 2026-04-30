@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python -c \"import ast; ast.parse\\(open\\('agent.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK: agent.py parses without errors'\\)\")",
-      "Bash(grep -l \"import agent\\\\|from agent\" \"c:/Users/louis/kDrive/AI_agent/\"*.py)"
-    ]
-  }
-}
