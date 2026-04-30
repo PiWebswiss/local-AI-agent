@@ -1,0 +1,11 @@
+1. tu peux corriger le text dans Documentation Technique_v4.docx puis le sauvegarder sur Documentation Technique_v4_corrected.docx
+2. how dose a pc works in 1980 ?
+3. can you correct the text in that file please test.docx
+
+docker compose run --rm agent python agent.py index --file "Ils étaient dix (a_k_a_ Dix petits nègres) -- CHRISTIE, Agatha -- A_Christie 1, 1939 -- Le Livre de poche.pdf"
+docker compose run --rm --build agent python agent.py index --file "Ils étaient dix.pdf"
+
+Then start chat normally:
+docker compose run --rm agent
+
+4. who is alan turing and did he built the pyramids

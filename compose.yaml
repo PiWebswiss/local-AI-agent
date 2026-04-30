@@ -1,7 +1,8 @@
 # Local AI stack:
 # - `ollama` runs local model inference
 # - `ollama_init` pre-pulls the configured model
-# - `agent` runs the CLI assistant
+# - `web` serves the modern web UI on http://localhost:8000 (default for `docker compose up`)
+# - `agent` runs the CLI assistant (use `docker compose run --rm agent` for terminal mode)
 services:
   ollama:
     # Official Ollama runtime image.
@@ -38,9 +39,9 @@ services:
       # Internal URL used by the pull command.
       OLLAMA_HOST: http://ollama:11434
       # Model to pull once at startup (configurable from `.env`).
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma3:1b}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e2b}
       # Optional committee models to pre-pull.
-      AGENT_MULTI_MODELS: ${AGENT_MULTI_MODELS:-gemma3:1b,llama3.2:3b,qwen2.5:1.5b}
+      AGENT_MULTI_MODELS: ${AGENT_MULTI_MODELS:-qwen3:1.7b,llama3.2:3b,gemma3:4b}
     # Pull primary model and any configured committee models.
     entrypoint:
       [
@@ -51,9 +52,124 @@ services:
     # One-shot task: do not restart after completion.
     restart: "no"
 
-  agent:
-    # Build local image from Dockerfile in repo root.
+  whisperx:
+    # Local speech-to-text microservice (WhisperX, defaults to "tiny" model).
+    # OPT-IN: only builds/starts when the "voice" profile is active. The
+    # repo ships start.cmd / start.sh which ask the user once on first run
+    # and set COMPOSE_PROFILES=voice if they opt in, then call compose. Users
+    # who skip the question never pay the ~1.5 GB image build or model pull.
+    profiles: ["voice"]
+    build: ./whisperx_service
+    # Expose GPU(s) to WhisperX. The service auto-falls back to CPU at runtime
+    # if no GPU is visible, so this stays safe on CPU-only hosts that have the
+    # NVIDIA Container Toolkit installed; on hosts without the toolkit, comment
+    # this line out (or override the service in a compose.override.yaml).
+    gpus: all
+    networks:
+      - backend
+      # Egress only needed on first run to download model weights from
+      # HuggingFace; cached to the named volume below afterwards.
+      - egress
+    environment:
+      WHISPERX_MODEL: ${WHISPERX_MODEL:-tiny}
+      WHISPERX_DEVICE: ${WHISPERX_DEVICE:-auto}
+      WHISPERX_COMPUTE_TYPE: ${WHISPERX_COMPUTE_TYPE:-}
+      WHISPERX_BATCH_SIZE: ${WHISPERX_BATCH_SIZE:-8}
+    volumes:
+      # Persist downloaded model weights across container restarts.
+      - whisperx_cache:/cache
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; urllib.request.urlopen('http://localhost:9000/healthz', timeout=3); sys.exit(0)\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      # First boot downloads the model — give it time before marking unhealthy.
+      start_period: 90s
+    restart: unless-stopped
+
+  web:
+    # Modern web UI on http://localhost:8000
     build: .
+    depends_on:
+      ollama_init:
+        condition: service_completed_successfully
+      # whisperx is intentionally NOT a hard dependency: the web UI polls
+      # /api/health and reveals the Talk button as soon as transcription
+      # comes online, so the app stays responsive while whisperx pulls model
+      # weights on first boot (and still works fully if whisperx ever fails).
+    networks:
+      - backend
+      - egress
+    ports:
+      - "${WEB_PORT:-8000}:8000"
+    environment:
+      HOME: /tmp
+      XDG_CACHE_HOME: /tmp/.cache
+      XDG_CONFIG_HOME: /tmp/.config
+      XDG_DATA_HOME: /tmp/.local/share
+      AGENT_RAG_DIR: /rag
+      AGENT_OUT_DIR: /files
+      OLLAMA_HOST: http://ollama:11434
+      WHISPERX_URL: http://whisperx:9000
+      WHISPERX_TIMEOUT_S: ${WHISPERX_TIMEOUT_S:-120}
+      # Hard cap on uploaded audio size to prevent oversized blobs from tying
+      # up the transcription worker. Default ~25 MB.
+      WHISPERX_MAX_UPLOAD_BYTES: ${WHISPERX_MAX_UPLOAD_BYTES:-25000000}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e2b}
+      OLLAMA_MAX_B: ${OLLAMA_MAX_B:-0}
+      OLLAMA_TIMEOUT_S: ${OLLAMA_TIMEOUT_S:-120}
+      AGENT_MULTI_AGENT: ${AGENT_MULTI_AGENT:-on}
+      AGENT_MULTI_SCOPES: ${AGENT_MULTI_SCOPES:-chat,research,book,summarize,correct}
+      AGENT_MULTI_MODELS: ${AGENT_MULTI_MODELS:-qwen3:1.7b,llama3.2:3b,gemma3:4b}
+      AGENT_MULTI_SMART: ${AGENT_MULTI_SMART:-on}
+      AGENT_MULTI_SIMPLE_MODELS: ${AGENT_MULTI_SIMPLE_MODELS:-1}
+      AGENT_MULTI_MEDIUM_MODELS: ${AGENT_MULTI_MEDIUM_MODELS:-2}
+      AGENT_MULTI_HARD_MODELS: ${AGENT_MULTI_HARD_MODELS:-0}
+      AGENT_MULTI_ROLE_MODE: ${AGENT_MULTI_ROLE_MODE:-on}
+      AGENT_MULTI_PEER_REVIEW: ${AGENT_MULTI_PEER_REVIEW:-on}
+      AGENT_MULTI_REVIEWERS: ${AGENT_MULTI_REVIEWERS:-0}
+      AGENT_MULTI_MAX_WORKERS: ${AGENT_MULTI_MAX_WORKERS:-0}
+      AGENT_MULTI_DRAFT_TEMP: ${AGENT_MULTI_DRAFT_TEMP:-0.25}
+      # Context compression: summarize older chat memory once it exceeds the
+      # threshold so long sessions stay coherent without blowing up the prompt.
+      AGENT_MEMORY_COMPRESS: ${AGENT_MEMORY_COMPRESS:-on}
+      AGENT_MEMORY_COMPRESS_THRESHOLD_CHARS: ${AGENT_MEMORY_COMPRESS_THRESHOLD_CHARS:-8000}
+      AGENT_MEMORY_KEEP_RECENT_TURNS: ${AGENT_MEMORY_KEEP_RECENT_TURNS:-4}
+      # Sub-agent spawning: decompose multi-part requests into parallel
+      # sub-tasks (chat or research) and synthesize one final answer.
+      AGENT_SUBAGENTS: ${AGENT_SUBAGENTS:-off}
+      AGENT_SUBAGENTS_MAX: ${AGENT_SUBAGENTS_MAX:-3}
+      AGENT_SUBAGENTS_MAX_WORKERS: ${AGENT_SUBAGENTS_MAX_WORKERS:-0}
+      OCR_SPACE_API_KEY: ${OCR_SPACE_API_KEY:-}
+      OCR_SPACE_LANGUAGE: ${OCR_SPACE_LANGUAGE:-eng}
+      OCR_SPACE_TIMEOUT_S: ${OCR_SPACE_TIMEOUT_S:-60}
+      OCR_SPACE_MAX_BYTES: ${OCR_SPACE_MAX_BYTES:-8000000}
+      WEB_HOST: 0.0.0.0
+      WEB_PORT: "8000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    volumes:
+      - ./files:/files
+      - ./rag:/rag
+    command: ["python", "web_server.py"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; urllib.request.urlopen('http://localhost:8000/api/health', timeout=3); sys.exit(0)\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  agent:
+    # CLI assistant — opt-in via `docker compose run --rm agent`
+    build: .
+    profiles: ["cli"]
     depends_on:
       ollama_init:
         # Start chat container only after model pull succeeds.
@@ -74,7 +190,7 @@ services:
       # Internal Ollama URL for chat requests.
       OLLAMA_HOST: http://ollama:11434
       # Default local model (can be changed in `.env`).
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma3:1b}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e2b}
       # Optional model-size guardrail (0 disables cap).
       OLLAMA_MAX_B: ${OLLAMA_MAX_B:-0}
       # Ollama request timeout (seconds).
@@ -84,7 +200,7 @@ services:
       # Which answer paths should use multi-agent mode.
       AGENT_MULTI_SCOPES: ${AGENT_MULTI_SCOPES:-chat,research,book,summarize,correct}
       # Optional extra Ollama models (comma-separated) used as draft agents.
-      AGENT_MULTI_MODELS: ${AGENT_MULTI_MODELS:-gemma3:1b,llama3.2:3b,qwen2.5:1.5b}
+      AGENT_MULTI_MODELS: ${AGENT_MULTI_MODELS:-qwen3:1.7b,llama3.2:3b,gemma3:4b}
       # Smart model selection by prompt complexity.
       AGENT_MULTI_SMART: ${AGENT_MULTI_SMART:-on}
       # Target model counts by complexity (0 = use all configured models).
@@ -101,6 +217,14 @@ services:
       AGENT_MULTI_MAX_WORKERS: ${AGENT_MULTI_MAX_WORKERS:-0}
       # Default draft temperature when model options do not set one.
       AGENT_MULTI_DRAFT_TEMP: ${AGENT_MULTI_DRAFT_TEMP:-0.25}
+      # Context compression for the CLI chat session.
+      AGENT_MEMORY_COMPRESS: ${AGENT_MEMORY_COMPRESS:-on}
+      AGENT_MEMORY_COMPRESS_THRESHOLD_CHARS: ${AGENT_MEMORY_COMPRESS_THRESHOLD_CHARS:-8000}
+      AGENT_MEMORY_KEEP_RECENT_TURNS: ${AGENT_MEMORY_KEEP_RECENT_TURNS:-4}
+      # Sub-agent spawning for the CLI chat loop.
+      AGENT_SUBAGENTS: ${AGENT_SUBAGENTS:-off}
+      AGENT_SUBAGENTS_MAX: ${AGENT_SUBAGENTS_MAX:-3}
+      AGENT_SUBAGENTS_MAX_WORKERS: ${AGENT_SUBAGENTS_MAX_WORKERS:-0}
       # OCR.Space API key for image/OCR extraction.
       OCR_SPACE_API_KEY: ${OCR_SPACE_API_KEY:-}
       # Default OCR language code used when prompt/file does not specify one.
@@ -136,6 +260,8 @@ services:
 volumes:
   # Named volume holding Ollama model data.
   ollama:
+  # Cached WhisperX model weights so first-run downloads aren't repeated.
+  whisperx_cache:
 
 networks:
   backend:

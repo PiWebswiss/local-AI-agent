@@ -9,7 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 
 class OllamaError(RuntimeError):
@@ -68,6 +68,13 @@ class OllamaConfig:
         return OllamaConfig(host=host, model=model, timeout_s=timeout_s)
 
 
+# Default `keep_alive` for Ollama — keeps the model resident in VRAM so the
+# next request avoids the multi-second model-load penalty. Override via env
+# `OLLAMA_KEEP_ALIVE=10m`/`-1`/`5m` etc.
+def _keep_alive() -> str:
+    return (os.getenv("OLLAMA_KEEP_ALIVE") or "10m").strip() or "10m"
+
+
 # Low-level chat call used by all agent answer paths.
 def chat(
     *,
@@ -75,15 +82,13 @@ def chat(
     messages: list[dict[str, str]],
     options: dict[str, Any] | None = None,
 ) -> str:
-    # Build Ollama chat endpoint URL.
     url = f"{config.host}/api/chat"
-    # Build non-streaming payload; caller expects one final response string.
     payload: dict[str, Any] = {
         "model": config.model,
         "messages": messages,
         "stream": False,
+        "keep_alive": _keep_alive(),
     }
-    # Include model options only when provided.
     if options:
         payload["options"] = options
 
@@ -129,3 +134,65 @@ def chat(
         raise OllamaError("Unexpected response shape from Ollama.")
     # Return trimmed text for CLI display.
     return content.strip()
+
+
+def chat_stream(
+    *,
+    config: OllamaConfig,
+    messages: list[dict[str, str]],
+    options: dict[str, Any] | None = None,
+) -> Iterator[str]:
+    """Yield Ollama assistant content chunks as they arrive (NDJSON stream).
+
+    Used by the web UI for live token display so the answer renders
+    incrementally instead of after a long blocking wait.
+    """
+    url = f"{config.host}/api/chat"
+    payload: dict[str, Any] = {
+        "model": config.model,
+        "messages": messages,
+        "stream": True,
+        "keep_alive": _keep_alive(),
+    }
+    if options:
+        payload["options"] = options
+
+    req = urllib.request.Request(
+        url,
+        method="POST",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/x-ndjson",
+        },
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=config.timeout_s)
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        raise OllamaError(f"Ollama HTTP {e.code}: {body or e.reason}") from e
+    except urllib.error.URLError as e:
+        raise OllamaError(
+            f"Failed to reach Ollama at {config.host}. "
+            f"Is Ollama running and accessible? ({e.reason})"
+        ) from e
+
+    # Iterate NDJSON: one JSON object per line, each carrying a partial
+    # assistant message until `done: true` arrives.
+    for raw in resp:
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception:
+            continue
+        msg = obj.get("message") or {}
+        chunk = msg.get("content") or ""
+        if isinstance(chunk, str) and chunk:
+            yield chunk
+        if obj.get("done"):
+            break

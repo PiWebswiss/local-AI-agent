@@ -11,6 +11,7 @@ import atexit
 import argparse
 import asyncio
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
@@ -621,8 +622,16 @@ def _committee_enabled_for(scope: str) -> bool:
     return "all" in scopes or token in scopes
 
 
+_COMMITTEE_MODELS_CACHE: dict[tuple[str, str], list[str]] = {}
+
+
 def _committee_models(primary_model: str) -> list[str]:
     raw = (os.getenv("AGENT_MULTI_MODELS", "") or "").strip()
+    cache_key = ((primary_model or "").strip(), raw)
+    cached = _COMMITTEE_MODELS_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+
     seen: set[str] = set()
     models: list[str] = []
 
@@ -646,6 +655,8 @@ def _committee_models(primary_model: str) -> list[str]:
     # Add optional extra models from environment list.
     for item in re.split(r"[,\n;|]+", raw):
         _push(item)
+
+    _COMMITTEE_MODELS_CACHE[cache_key] = list(models)
     return models
 
 
@@ -788,8 +799,9 @@ def _looks_like_confidence_challenge(text: str) -> bool:
     return any(m in low for m in markers)
 
 
-def _committee_complexity_level(*, scope: str, messages: list[dict[str, str]]) -> str:
+def _committee_complexity_level(*, scope: str, messages: list[dict[str, str]]) -> tuple[str, int]:
     # Estimate request complexity without extra model calls.
+    # Returns (level, score) so callers can gauge confidence in the verdict.
     text = _extract_primary_question(scope=scope, text=_latest_user_text(messages))
     low = text.lower()
     token_count = len(re.findall(r"\w+", text))
@@ -842,10 +854,10 @@ def _committee_complexity_level(*, scope: str, messages: list[dict[str, str]]) -
         score -= 1
 
     if score <= 0:
-        return "simple"
+        return "simple", score
     if score <= 2:
-        return "medium"
-    return "hard"
+        return "medium", score
+    return "hard", score
 
 
 def _committee_complexity_with_llm(
@@ -902,11 +914,14 @@ def _committee_active_models(
     if not _env_flag("AGENT_MULTI_SMART", default=True):
         return models, "hard"
 
-    # Keep simple requests fast: classify heuristically first and avoid extra planner calls when already simple.
-    heuristic_level = _committee_complexity_level(scope=scope, messages=messages)
+    # Keep simple requests fast: classify heuristically first and only spend an
+    # extra planner LLM call when the heuristic is uncertain. Both endpoints
+    # of the score range (clearly simple, clearly hard) are trusted as-is.
+    heuristic_level, heuristic_score = _committee_complexity_level(scope=scope, messages=messages)
     level: str = heuristic_level
+    heuristic_high_confidence = heuristic_level == "simple" or heuristic_score >= 4
     if (
-        heuristic_level != "simple"
+        not heuristic_high_confidence
         and config is not None
         and _env_flag("AGENT_MULTI_DISPATCH_LLM", default=True)
     ):
@@ -927,9 +942,12 @@ def _committee_active_models(
     if count >= len(models):
         return models, level
     # Rotate selection so different models get used across requests instead
-    # of always picking the first N.
+    # of always picking the first N. Use a stable hash so rotation is
+    # deterministic across process restarts (Python's built-in hash() is
+    # randomized per-process by PYTHONHASHSEED).
     question = _latest_user_text(messages)
-    offset = hash(question) % len(models)
+    digest = hashlib.blake2b(question.encode("utf-8", "ignore"), digest_size=8).digest()
+    offset = int.from_bytes(digest, "big") % len(models)
     rotated = models[offset:] + models[:offset]
     return rotated[:count], level
 
@@ -1049,6 +1067,8 @@ def _committee_peer_review(
                 best_id = int(data.get("best_id"))
             except Exception:
                 best_id = 0
+            # Two-tier scoring: a "best_id" vote is worth more than per-draft
+            # numeric scores so reviewers' explicit picks dominate ties.
             if best_id in scores:
                 scores[best_id] += 2.0
                 votes[best_id] += 1
@@ -1065,6 +1085,8 @@ def _committee_peer_review(
                         continue
                     if draft_id not in scores:
                         continue
+                    # Normalize 0-10 reviewer scores to 0-1 so they accumulate
+                    # below the per-vote weight (2.0) without dominating it.
                     row_score = max(0.0, min(10.0, row_score))
                     scores[draft_id] += row_score / 10.0
 
@@ -1595,13 +1617,15 @@ def _extract_urls(text: str) -> list[str]:
     return [m.group(0).rstrip(").,;]}>\"'") for m in _URL_RE.finditer(text or "")]
 
 
-def _looks_like_web_request(text: str) -> bool:
+def _looks_like_strong_web_request(text: str) -> bool:
+    """Web signals that should override book mode even when a book is loaded:
+    explicit URLs, recency markers, news/forecast keywords. Fact-lookup
+    patterns like 'who is X' are deliberately excluded — when a book is
+    active, those should default to the book."""
     t = (text or "").strip().lower()
     if not t:
         return False
     if "http://" in t or "https://" in t:
-        return True
-    if _looks_like_fact_lookup_query(t):
         return True
     if _looks_like_weather_query(t):
         return True
@@ -1609,7 +1633,6 @@ def _looks_like_web_request(text: str) -> bool:
         return True
     if re.search(r"\bto+day(s)?\b", t):
         return True
-    # Strong web-intent keywords (unambiguous).
     strong_web = (
         "search",
         "look up",
@@ -1623,6 +1646,17 @@ def _looks_like_web_request(text: str) -> bool:
         "forecast",
     )
     if any(k in t for k in strong_web):
+        return True
+    return False
+
+
+def _looks_like_web_request(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if _looks_like_strong_web_request(t):
+        return True
+    if _looks_like_fact_lookup_query(t):
         return True
     # Ambiguous keywords — only count them as web intent when they appear
     # in an information-seeking context (questions / short prompts), not in
@@ -1682,20 +1716,33 @@ def _announce_mode(ui: "_ChatUI", mode: str, detail: str) -> None:
 
 
 def _looks_like_small_talk(text: str) -> bool:
-    t = (text or "").strip().lower()
+    t = (text or "").strip().lower().rstrip("?!.").strip()
     if not t:
         return False
-    small_talk_markers = [
+    # Anchored greetings / pleasantries — must be at the start so we don't
+    # misclassify long sentences that happen to contain "hi" or "hey".
+    starts = (
         "hello",
-        "hi",
+        "hi ",
+        "hi,",
+        "hi!",
         "hey",
-        "how are you",
+        "hi there",
+        "hello there",
+        "yo ",
+        "good morning",
+        "good evening",
+        "good afternoon",
+        "bonjour",
+        "salut",
         "thanks",
         "thank you",
-        "who are you",
-        "what can you do",
-    ]
-    return any(marker in t for marker in small_talk_markers)
+        "merci",
+    )
+    if t in {"hi", "hey", "yo", "ok", "okay", "yes", "no", "sure", "cool"} or t.startswith(starts):
+        return True
+    contains = ("how are you", "who are you", "what can you do", "qui es-tu", "que peux-tu")
+    return any(m in t for m in contains)
 
 
 def _decide_mode_for_prompt(
@@ -1723,19 +1770,30 @@ def _decide_mode_for_prompt(
 
     # Compute web/book/small-talk signals once and reuse them.
     is_web = intent == "research" or _looks_like_web_request(prompt)
+    # When a book is loaded, only "strong" web signals (URLs, recency markers,
+    # news/forecast keywords) should override book mode. Fact-lookup patterns
+    # like "who is X?" should default to the book — that's why the user
+    # uploaded one.
+    is_strong_web = _looks_like_strong_web_request(prompt)
     is_book_hint = _looks_like_book_request(prompt) if has_active_book else False
     is_small_talk = _looks_like_small_talk(prompt)
+
+    # Short-circuit small talk to chat — no need to spend a router LLM call
+    # on "hello" / "thanks" / "who are you", which would otherwise stall on
+    # large models (5-10s+ even on GPU, much worse on CPU).
+    if is_small_talk and not is_web and not is_book_hint:
+        return "chat", base_route
 
     if is_web and not has_active_book:
         return "web", {**base_route, "action": "research"}
 
     # --- book-mode short-circuits (skip LLM when the intent is clear) ---
     if has_active_book:
-        if is_web and not is_book_hint:
+        if is_strong_web and not is_book_hint:
             return "web", {**base_route, "action": "research"}
         if is_book_hint:
             return "book", base_route
-        if not is_small_talk and not is_web:
+        if not is_small_talk:
             return "book", base_route
 
     # --- LLM router (only reached when heuristics are inconclusive) ---
@@ -2060,6 +2118,449 @@ def _append_session_memory(
     trimmed = _trim_session_memory(memory, max_turns=max_turns)
     if trimmed is not memory:
         memory[:] = trimmed
+
+
+# === Context compression =====================================================
+# Replaces the older portion of session memory with a single LLM-generated
+# summary once accumulated content exceeds a configurable threshold. Recent
+# turns are kept verbatim so the model still has fresh dialogue to react to.
+
+_MEMORY_SUMMARY_PREFIX = "[Earlier conversation summary]"
+
+
+def _is_memory_summary(message: dict[str, str]) -> bool:
+    if str(message.get("role", "") or "") != "system":
+        return False
+    content = str(message.get("content", "") or "")
+    return content.startswith(_MEMORY_SUMMARY_PREFIX)
+
+
+def _summarize_memory_block(
+    *,
+    older: list[dict[str, str]],
+    config: local_ollama.OllamaConfig,
+    on_status: Callable[[str], None] | None = None,
+) -> str:
+    if not older:
+        return ""
+    transcript_lines: list[str] = []
+    for msg in older:
+        role = str(msg.get("role", "user") or "user").strip().lower()
+        content = str(msg.get("content", "") or "").strip()
+        if not content:
+            continue
+        if _is_memory_summary(msg):
+            # Carry forward any prior summary so we don't lose context.
+            transcript_lines.append(f"PRIOR_SUMMARY:\n{content[len(_MEMORY_SUMMARY_PREFIX):].lstrip()}")
+            continue
+        label = {"user": "USER", "assistant": "ASSISTANT", "system": "SYSTEM"}.get(role, role.upper())
+        transcript_lines.append(f"{label}: {content}")
+    transcript = "\n\n".join(transcript_lines).strip()
+    if not transcript:
+        return ""
+
+    system = (
+        "You compress an ongoing chat history into a compact briefing the same "
+        "assistant will read on the next turn.\n"
+        "Keep ONLY what future turns will need:\n"
+        "- the user's identity, role, language, and stated goals\n"
+        "- key facts established and decisions made\n"
+        "- open questions, pending tasks, or constraints the user mentioned\n"
+        "- file names, URLs, model/book selections that came up\n"
+        "Drop pleasantries, intermediate reasoning, and redundant restatements.\n"
+        "Write in compact bullet form. Aim for under 250 words. Do not address "
+        "the user directly; this is an internal note for the assistant."
+    )
+    user = f"Conversation so far:\n\n{transcript}"
+    try:
+        raw = _chat_with_retries(
+            config=config,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            options={"temperature": 0.0, "num_ctx": 4096, "num_predict": 400},
+            max_attempts=1,
+            on_status=on_status,
+            status_label="Compressing context...",
+        )
+    except Exception:
+        return ""
+    return (raw or "").strip()
+
+
+def _maybe_compress_session_memory(
+    memory: list[dict[str, str]],
+    *,
+    config: local_ollama.OllamaConfig,
+    on_status: Callable[[str], None] | None = None,
+) -> list[dict[str, str]]:
+    if not memory or not _env_flag("AGENT_MEMORY_COMPRESS", default=True):
+        return memory
+
+    threshold = max(1000, _env_int("AGENT_MEMORY_COMPRESS_THRESHOLD_CHARS", default=8000))
+    total_chars = sum(len(str(m.get("content", "") or "")) for m in memory)
+    if total_chars < threshold:
+        return memory
+
+    keep_recent_pairs = max(1, _env_int("AGENT_MEMORY_KEEP_RECENT_TURNS", default=4))
+    keep_items = keep_recent_pairs * 2
+
+    # Always preserve a leading summary if one already exists.
+    head_summary: list[dict[str, str]] = []
+    body = memory
+    if memory and _is_memory_summary(memory[0]):
+        head_summary = [memory[0]]
+        body = memory[1:]
+
+    if len(body) <= keep_items:
+        return memory
+
+    older = body[:-keep_items]
+    recent = body[-keep_items:]
+
+    if on_status is not None:
+        on_status(f"Compressing context ({total_chars} chars > {threshold})...")
+
+    summary = _summarize_memory_block(older=head_summary + older, config=config, on_status=on_status)
+    if not summary:
+        return memory
+
+    summary_msg = {"role": "system", "content": f"{_MEMORY_SUMMARY_PREFIX}\n{summary}"}
+    return [summary_msg, *recent]
+
+
+# === Sub-agent spawning ======================================================
+# Plans a small set of independent sub-tasks for genuinely multi-part user
+# requests, runs them in parallel via fresh agent calls, then synthesizes one
+# final answer. Disabled by default — enable with AGENT_SUBAGENTS=on.
+
+_SUBAGENT_VALID_SCOPES = {"chat", "research"}
+
+# Cheap structural markers that hint a request might genuinely decompose into
+# independent sub-tasks. Used to gate the planner LLM call so it doesn't fire
+# on every turn — most chat prompts ("hi", "thanks", single-fact questions)
+# never need decomposition and shouldn't pay for a planner round-trip.
+_SUBAGENT_DECOMP_MARKERS = (
+    " and also ",
+    " and then ",
+    " then ",
+    " also ",
+    " plus ",
+    " as well as ",
+    " versus ",
+    " vs ",
+    " compare ",
+    " comparison ",
+    " both ",
+    " each of ",
+    " for each ",
+    " et aussi ",
+    " ainsi que ",
+    " puis ",
+    " comparer ",
+    " chacun ",
+    "1.",
+    "2.",
+    "- ",
+    "* ",
+)
+
+
+def _subagents_enabled() -> bool:
+    return _env_flag("AGENT_SUBAGENTS", default=False)
+
+
+def _looks_potentially_multipart(message: str) -> bool:
+    """Cheap heuristic to short-circuit the sub-agent planner for prompts
+    that almost certainly do not decompose into independent sub-tasks.
+
+    Returns True only when there are concrete structural signals — multiple
+    sentences, list markers, comparison/conjunction words, or multiple URLs.
+    Bypassed when AGENT_SUBAGENTS_ALWAYS_PLAN=on for users who'd rather have
+    the planner judge every turn."""
+    if _env_flag("AGENT_SUBAGENTS_ALWAYS_PLAN", default=False):
+        return True
+
+    text = (message or "").strip()
+    if not text:
+        return False
+
+    token_count = len(re.findall(r"\w+", text))
+    if token_count < 12:
+        return False
+
+    low = " " + text.lower() + " "
+    if any(marker in low for marker in _SUBAGENT_DECOMP_MARKERS):
+        return True
+
+    # Multiple sentences (>=2 terminal punctuation marks) is a weak signal of
+    # a multi-part request when combined with sufficient length.
+    sentence_breaks = len(re.findall(r"[.!?]\s+\S", text))
+    if sentence_breaks >= 2 and token_count >= 25:
+        return True
+
+    # Multiple question marks → likely several questions in one prompt.
+    if text.count("?") >= 2:
+        return True
+
+    # Multiple URLs → likely "summarize/compare these sources" patterns.
+    if len(_extract_urls(text)) >= 2:
+        return True
+
+    return False
+
+
+def _plan_subagents(
+    *,
+    message: str,
+    config: local_ollama.OllamaConfig,
+    on_status: Callable[[str], None] | None = None,
+) -> list[dict[str, str]]:
+    text = (message or "").strip()
+    if not text:
+        return []
+    max_n = max(2, min(6, _env_int("AGENT_SUBAGENTS_MAX", default=3)))
+
+    system = (
+        "You plan whether a user request should be split into independent "
+        "sub-tasks for parallel local agents.\n"
+        "Return ONLY JSON with this schema:\n"
+        '{"tasks": [{"scope": "chat|research", "prompt": "..."}]}\n'
+        "Rules:\n"
+        f"- Return at most {max_n} sub-tasks.\n"
+        "- Return an empty list when the request has a single focus or is short.\n"
+        "- Each sub-task MUST be self-contained (no pronouns referring to the user "
+        "or other sub-tasks; restate any context the sub-agent needs).\n"
+        "- scope=research only when current/external/web information is required; "
+        "use scope=chat for reasoning, explanation, or knowledge already in the model.\n"
+        "- Do NOT split simple questions, greetings, or single-fact lookups."
+    )
+    try:
+        raw = _chat_with_retries(
+            config=config,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": text}],
+            options={"temperature": 0.0, "num_ctx": 2048, "num_predict": 400},
+            max_attempts=1,
+            on_status=on_status,
+            status_label="Planning sub-agents...",
+        )
+    except Exception:
+        return []
+
+    data = _parse_json_dict(raw)
+    if not isinstance(data, dict):
+        return []
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list):
+        return []
+
+    out: list[dict[str, str]] = []
+    for item in tasks:
+        if not isinstance(item, dict):
+            continue
+        scope = str(item.get("scope", "chat") or "chat").strip().lower()
+        prompt = str(item.get("prompt", "") or "").strip()
+        if not prompt:
+            continue
+        if scope not in _SUBAGENT_VALID_SCOPES:
+            scope = "chat"
+        out.append({"scope": scope, "prompt": prompt})
+        if len(out) >= max_n:
+            break
+
+    # Sub-agents only earn their cost when there are at least two tasks.
+    return out if len(out) >= 2 else []
+
+
+def _run_subagent(
+    *,
+    scope: str,
+    prompt: str,
+    config: local_ollama.OllamaConfig,
+    on_status: Callable[[str], None] | None = None,
+    research_kwargs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    scope_norm = (scope or "chat").strip().lower()
+    if scope_norm == "research":
+        kwargs = dict(research_kwargs or {})
+        try:
+            ans, urls = asyncio.run(
+                research_answer(
+                    prompt,
+                    config=config,
+                    on_status=on_status,
+                    **kwargs,
+                )
+            )
+            return {
+                "scope": "research",
+                "prompt": prompt,
+                "answer": (ans or "").strip(),
+                "sources": list(urls or []),
+                "error": "",
+            }
+        except Exception as exc:
+            return {"scope": "research", "prompt": prompt, "answer": "", "sources": [], "error": str(exc)}
+
+    # Default path: chat scope, fresh memory.
+    messages = [
+        {"role": "system", "content": _CHAT_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        ans = _generate_answer(
+            scope="chat",
+            config=config,
+            messages=messages,
+            options={"temperature": 0.2, "num_ctx": 4096, "num_predict": 800},
+            on_status=on_status,
+            status_label="Sub-agent thinking...",
+        )
+        return {"scope": "chat", "prompt": prompt, "answer": (ans or "").strip(), "sources": [], "error": ""}
+    except Exception as exc:
+        return {"scope": "chat", "prompt": prompt, "answer": "", "sources": [], "error": str(exc)}
+
+
+def _run_subagents_parallel(
+    *,
+    plan: list[dict[str, str]],
+    config: local_ollama.OllamaConfig,
+    on_status: Callable[[str], None] | None = None,
+    research_kwargs: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if not plan:
+        return []
+    workers = max(1, min(len(plan), _env_int("AGENT_SUBAGENTS_MAX_WORKERS", default=len(plan))))
+
+    completed = 0
+    results: list[dict[str, Any] | None] = [None] * len(plan)
+
+    def _runner(idx: int, task: dict[str, str]) -> tuple[int, dict[str, Any]]:
+        return idx, _run_subagent(
+            scope=task["scope"],
+            prompt=task["prompt"],
+            config=config,
+            on_status=None,  # avoid status spam from parallel sub-agents
+            research_kwargs=research_kwargs,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_runner, i, t) for i, t in enumerate(plan)]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                idx, result = future.result()
+            except Exception as exc:
+                idx, result = -1, {"scope": "chat", "prompt": "", "answer": "", "sources": [], "error": str(exc)}
+            if 0 <= idx < len(results):
+                results[idx] = result
+            completed += 1
+            if on_status is not None:
+                on_status(f"Sub-agents: {completed}/{len(plan)} done")
+
+    return [r for r in results if r is not None]
+
+
+def _synthesize_subagent_results(
+    *,
+    message: str,
+    results: list[dict[str, Any]],
+    config: local_ollama.OllamaConfig,
+    on_status: Callable[[str], None] | None = None,
+) -> str:
+    usable = [r for r in results if (r.get("answer") or "").strip()]
+    if not usable:
+        return ""
+    if len(usable) == 1:
+        return str(usable[0].get("answer", "") or "").strip()
+
+    blocks: list[str] = []
+    for i, r in enumerate(usable, start=1):
+        scope = r.get("scope", "chat")
+        prompt = (r.get("prompt") or "").strip()
+        answer = (r.get("answer") or "").strip()
+        sources = r.get("sources") or []
+        block = f"[{i}] scope={scope}\nSub-task: {prompt}\nAnswer:\n{answer}"
+        if sources:
+            block += "\n\nSources:\n" + "\n".join(f"- {s}" for s in sources[:6])
+        blocks.append(block)
+
+    system = (
+        "You combine results from independent sub-agents into one cohesive answer.\n"
+        "Rules:\n"
+        "- Stay strictly grounded in the sub-agent results; do not invent new facts.\n"
+        "- Cover every sub-task — do not silently drop one.\n"
+        "- If sub-agents conflict, note the disagreement briefly.\n"
+        "- Keep it concise and practical for the user.\n"
+        "- Do not mention 'sub-agent', task numbers, or internal scopes in the output."
+    )
+    user = (
+        f"Original user request:\n{message}\n\n"
+        f"Sub-agent results:\n" + "\n\n".join(blocks)
+    )
+    try:
+        out = _chat_with_retries(
+            config=config,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            options={"temperature": 0.0, "num_ctx": 4096, "num_predict": 900},
+            max_attempts=2,
+            on_status=on_status,
+            status_label="Synthesizing sub-agent results...",
+        )
+    except Exception:
+        # Fallback: concatenate sub-agent answers with light formatting.
+        return "\n\n".join(f"### Part {i}\n{r['answer']}" for i, r in enumerate(usable, start=1))
+    return (out or "").strip()
+
+
+def _maybe_dispatch_subagents(
+    *,
+    message: str,
+    config: local_ollama.OllamaConfig,
+    on_status: Callable[[str], None] | None = None,
+    research_kwargs: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Top-level helper used by the chat dispatchers. Returns None when sub-agents
+    are disabled or the planner declined to decompose, so the caller falls back
+    to the normal single-mode pipeline."""
+    if not _subagents_enabled():
+        return None
+    # Cheap heuristic gate: skip the planner LLM call for prompts that show
+    # no structural sign of being multi-part.
+    if not _looks_potentially_multipart(message):
+        return None
+    if on_status is not None:
+        on_status("Planning sub-agents...")
+    plan = _plan_subagents(message=message, config=config, on_status=on_status)
+    if not plan:
+        return None
+    if on_status is not None:
+        on_status(f"Spawning {len(plan)} sub-agents...")
+    results = _run_subagents_parallel(
+        plan=plan,
+        config=config,
+        on_status=on_status,
+        research_kwargs=research_kwargs,
+    )
+    answer = _synthesize_subagent_results(
+        message=message,
+        results=results,
+        config=config,
+        on_status=on_status,
+    )
+    if not answer:
+        return None
+    merged_sources: list[str] = []
+    seen: set[str] = set()
+    for r in results:
+        for s in r.get("sources") or []:
+            key = str(s).strip()
+            if key and key not in seen:
+                seen.add(key)
+                merged_sources.append(key)
+    return {
+        "answer": answer,
+        "sources": merged_sources,
+        "plan": plan,
+        "results": results,
+    }
 
 
 def _looks_like_followup_summary_request(line: str) -> bool:
@@ -3097,6 +3598,17 @@ async def cmd_chat(args: argparse.Namespace) -> int:
             max_turns=memory_turns,
             max_chars=memory_max_chars,
         )
+        # Compression is deferred to the start of the next turn (see _compress_now
+        # below) to avoid blocking the response path with an LLM summarizer call.
+
+    def _compress_now() -> None:
+        compressed = _maybe_compress_session_memory(
+            chat_memory,
+            config=config,
+            on_status=_phase_note,
+        )
+        if compressed is not chat_memory:
+            chat_memory[:] = compressed
 
     def _phase_note(msg: str) -> None:
         ui.print_plain(msg, extra_newline=False)
@@ -3125,6 +3637,11 @@ async def cmd_chat(args: argparse.Namespace) -> int:
             continue
         if line in {"/exit", "/quit"}:
             return 0
+
+        # Run any pending memory compression before this turn does real work.
+        # Compression is deferred from _remember_exchange so the previous turn's
+        # response wasn't blocked by a summarizer LLM call.
+        _compress_now()
 
         if line in {"/help", "/?"}:
             ui.print_plain(
@@ -3376,6 +3893,34 @@ async def cmd_chat(args: argparse.Namespace) -> int:
             ui.print_markdown(msg, extra_newline=True)
             _remember_exchange(line, msg)
             continue
+
+        # Sub-agent decomposition: planner may split a multi-part request into
+        # parallel sub-tasks (chat / research scopes). When it does, we skip
+        # single-mode routing entirely and let the synthesizer write the answer.
+        if _subagents_enabled():
+            with ui.status("Planning sub-agents...") as status:
+                sub_research_kwargs = {
+                    "max_results": args.max_results,
+                    "max_sources": args.max_sources,
+                    "max_chars_per_source": args.max_chars,
+                    "use_mcp": not args.no_mcp,
+                    "verify_answers": quality_mode,
+                }
+                sub_result = _maybe_dispatch_subagents(
+                    message=line,
+                    config=config,
+                    on_status=ui.status_callback(status),
+                    research_kwargs=sub_research_kwargs,
+                )
+            if sub_result is not None:
+                msg = (sub_result.get("answer") or "").rstrip()
+                merged_sources = sub_result.get("sources") or []
+                if merged_sources:
+                    msg += "\n\nSources:\n" + "\n".join(f"- {s}" for s in merged_sources)
+                _announce_mode(ui, "subagents", f"synthesized {len(sub_result.get('plan') or [])} sub-agents")
+                ui.print_markdown(msg, extra_newline=True)
+                _remember_exchange(line, msg)
+                continue
 
         with ui.status("Understanding request...") as status:
             mode, route = _decide_mode_for_prompt(

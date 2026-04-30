@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Local AI Agent</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%237c5cff'/%3E%3Cpath d='M20 24h24M20 32h24M20 40h16' stroke='white' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E" />
+</head>
+<body>
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="brand-mark"></div>
+      <div>
+        <div class="brand-title">Local AI Agent</div>
+        <div class="brand-sub" id="brandStatus">Connecting…</div>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <button class="nav-item active" data-tab="chat">Chat</button>
+      <button class="nav-item" data-tab="books">Books</button>
+      <button class="nav-item" data-tab="files">Files</button>
+      <button class="nav-item" data-tab="models">Models</button>
+      <button class="nav-item" data-tab="settings">Settings</button>
+    </nav>
+
+    <div class="sidebar-section">
+      <div class="section-title">Active book</div>
+      <div class="active-book" id="activeBookLabel">None</div>
+      <button class="ghost-btn small" id="bookOffBtn" hidden>Disable book mode</button>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="section-title">Memory</div>
+      <div class="meta-row"><span id="memoryStatus">0 turns</span>
+        <button class="ghost-btn small" id="clearMemoryBtn">Clear</button>
+      </div>
+    </div>
+
+    <div class="sidebar-footer">
+      <label class="theme-toggle">
+        <input type="checkbox" id="themeToggle" />
+        <span>Light mode</span>
+      </label>
+    </div>
+  </aside>
+
+  <main class="main">
+    <!-- CHAT TAB -->
+    <section class="tab active" id="tab-chat">
+      <header class="tab-header">
+        <h1>Chat</h1>
+        <div class="header-actions">
+          <span class="badge" id="modelBadge">model: …</span>
+          <span class="badge subtle" id="qualityBadge">quality: on</span>
+        </div>
+      </header>
+
+      <div class="messages" id="messages"></div>
+
+      <div class="composer">
+        <div class="composer-meta">
+          <span id="phaseHint" class="phase-hint hidden"></span>
+        </div>
+        <form class="composer-row" id="composer">
+          <textarea
+            id="composerInput"
+            rows="1"
+            placeholder="Ask anything"
+            autocomplete="off"></textarea>
+          <button type="button" class="mic-btn" id="micBtn" title="Hold to talk — transcribed by WhisperX" aria-label="Record voice message">
+            <svg class="mic-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3z" fill="currentColor"/>
+              <path d="M19 11a7 7 0 0 1-14 0M12 18v3M9 21h6" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/>
+            </svg>
+            <span class="mic-label">Talk</span>
+          </button>
+          <button type="submit" class="primary-btn" id="sendBtn">Send</button>
+          <button type="button" class="primary-btn stop-btn" id="stopBtn" hidden>Stop</button>
+        </form>
+        <div class="composer-quick">
+          <button type="button" class="chip" data-prefix="/research ">Web</button>
+          <button type="button" class="chip" data-prefix="/chat ">Chat only</button>
+          <button type="button" class="chip" data-prefix="/correct ">Correct</button>
+          <button type="button" class="chip" data-prefix="/summarize ">Summarize</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- BOOKS TAB -->
+    <section class="tab" id="tab-books">
+      <header class="tab-header">
+        <h1>Books</h1>
+        <div class="header-actions">
+          <button class="primary-btn" id="refreshBooksBtn">Refresh</button>
+        </div>
+      </header>
+
+      <div class="card">
+        <h2>Indexed books</h2>
+        <p class="muted">Pick one to make it the active source for questions.</p>
+        <div id="booksList" class="books-list"></div>
+      </div>
+
+      <div class="card">
+        <h2>Index a new file</h2>
+        <p class="muted">Supported: <strong>PDF, DOCX, PPTX, XLSX, HTML, TXT, MD</strong> and images (PNG/JPG via OCR). Files are saved to <code>./files</code>, the index lives in <code>./rag</code>.</p>
+        <form id="indexForm" class="upload-form">
+          <label class="file-drop" id="indexDrop">
+            <input type="file" id="indexFile" required
+              accept=".pdf,.docx,.pptx,.xlsx,.xlsm,.xltx,.xltm,.html,.htm,.txt,.md,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/html,text/plain,image/*" />
+            <span class="file-drop-label">Drop a file here or click to browse</span>
+            <span class="file-drop-meta" id="indexFileMeta"></span>
+          </label>
+          <input type="text" id="indexName" placeholder="Optional name (defaults to filename)" />
+          <button type="submit" class="primary-btn">Index</button>
+        </form>
+        <div class="phase-log" id="indexPhases"></div>
+      </div>
+    </section>
+
+    <!-- FILES TAB -->
+    <section class="tab" id="tab-files">
+      <header class="tab-header">
+        <h1>Files</h1>
+      </header>
+
+      <div class="card">
+        <h2>Correct text or document</h2>
+        <p class="muted">Proofreads spelling, grammar, punctuation. Preserves DOCX formatting where possible. Accepts PDF, DOCX, PPTX, XLSX, HTML, TXT, images (OCR).</p>
+        <form id="correctForm" class="upload-form">
+          <label class="file-drop">
+            <input type="file" id="correctFile"
+              accept=".pdf,.docx,.pptx,.xlsx,.xlsm,.xltx,.xltm,.html,.htm,.txt,.md,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,application/pdf,text/plain,text/html,image/*" />
+            <span class="file-drop-label">Drop a file here or click to browse (optional)</span>
+            <span class="file-drop-meta" id="correctFileMeta"></span>
+          </label>
+          <textarea id="correctText" placeholder="…or paste text directly"></textarea>
+          <div class="form-row">
+            <label>Language
+              <select id="correctLanguage">
+                <option value="auto">Auto</option>
+                <option value="en">English</option>
+                <option value="fr">French</option>
+              </select>
+            </label>
+            <button type="submit" class="primary-btn">Correct</button>
+          </div>
+        </form>
+        <div class="phase-log" id="correctPhases"></div>
+        <pre class="result-text" id="correctResult"></pre>
+      </div>
+
+      <div class="card">
+        <h2>Summarize text or document</h2>
+        <p class="muted">Accepts PDF, DOCX, PPTX, XLSX, HTML, TXT, images (OCR), or paste text directly.</p>
+        <form id="summarizeForm" class="upload-form">
+          <label class="file-drop">
+            <input type="file" id="summarizeFile"
+              accept=".pdf,.docx,.pptx,.xlsx,.xlsm,.xltx,.xltm,.html,.htm,.txt,.md,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,application/pdf,text/plain,text/html,image/*" />
+            <span class="file-drop-label">Drop a file here or click to browse (optional)</span>
+            <span class="file-drop-meta" id="summarizeFileMeta"></span>
+          </label>
+          <textarea id="summarizeText" placeholder="…or paste text directly"></textarea>
+          <div class="form-row">
+            <label>Language
+              <select id="summarizeLanguage">
+                <option value="auto">Auto</option>
+                <option value="en">English</option>
+                <option value="fr">French</option>
+              </select>
+            </label>
+            <label>Length
+              <select id="summarizeLength">
+                <option value="short">Short</option>
+                <option value="medium">Medium</option>
+                <option value="long">Long</option>
+              </select>
+            </label>
+            <button type="submit" class="primary-btn">Summarize</button>
+          </div>
+        </form>
+        <div class="phase-log" id="summarizePhases"></div>
+        <div class="result-text" id="summarizeResult"></div>
+      </div>
+    </section>
+
+    <!-- MODELS TAB -->
+    <section class="tab" id="tab-models">
+      <header class="tab-header">
+        <h1>Models</h1>
+        <div class="header-actions">
+          <button class="primary-btn" id="refreshModelsBtn">Refresh</button>
+        </div>
+      </header>
+
+      <div class="card">
+        <h2>Primary model</h2>
+        <p class="muted">Used for routing and the lead synthesis step. Click any installed model to switch.</p>
+        <div class="model-current">
+          <span>Current:</span>
+          <strong id="currentPrimary">—</strong>
+        </div>
+        <div id="primaryModels" class="model-grid"></div>
+      </div>
+
+      <div class="card">
+        <h2>Multi-agent committee</h2>
+        <p class="muted">Multiple models draft, review, and merge answers. Toggle models in/out of the committee here. Changes apply immediately.</p>
+        <label class="switch-row">
+          <input type="checkbox" id="multiAgentToggle" />
+          <span>Enable multi-agent committee</span>
+        </label>
+        <div id="committeeModels" class="model-grid"></div>
+      </div>
+
+      <div class="card">
+        <h2>Pull a new model</h2>
+        <p class="muted">Downloads the model into Ollama. Common tags: <code>qwen3:1.7b</code>, <code>llama3.2:3b</code>, <code>gemma3:4b</code>, <code>phi3:mini</code>.</p>
+        <form id="pullForm" class="upload-form">
+          <input type="text" id="pullName" placeholder="model:tag" required />
+          <button type="submit" class="primary-btn">Pull</button>
+        </form>
+        <div class="phase-log" id="pullPhases"></div>
+      </div>
+    </section>
+
+    <!-- SETTINGS TAB -->
+    <section class="tab" id="tab-settings">
+      <header class="tab-header">
+        <h1>Settings</h1>
+        <div class="header-actions">
+          <button class="primary-btn" id="saveSettingsBtn">Save</button>
+        </div>
+      </header>
+
+      <div class="card">
+        <h2>Quality controls</h2>
+        <label class="switch-row">
+          <input type="checkbox" id="qualityToggle" />
+          <span>Quality mode (post-answer verification + stricter retries)</span>
+        </label>
+      </div>
+
+      <div class="card">
+        <h2>Multi-agent tuning</h2>
+        <div class="form-grid">
+          <label>Models for simple queries
+            <input type="number" id="simpleN" min="1" max="10" />
+          </label>
+          <label>Models for medium queries
+            <input type="number" id="mediumN" min="1" max="10" />
+          </label>
+          <label>Models for hard queries (0 = all)
+            <input type="number" id="hardN" min="0" max="10" />
+          </label>
+        </div>
+        <label class="switch-row">
+          <input type="checkbox" id="smartToggle" />
+          <span>Smart complexity-based dispatch</span>
+        </label>
+        <label class="switch-row">
+          <input type="checkbox" id="roleToggle" />
+          <span>Role-based drafting (solver / skeptic / grounding / editor)</span>
+        </label>
+        <label class="switch-row">
+          <input type="checkbox" id="peerToggle" />
+          <span>Peer review pass before merge</span>
+        </label>
+      </div>
+
+      <div class="card">
+        <h2>Voice input</h2>
+        <p class="muted">When enabled, a Talk button appears in the chat composer. Clicking it records from your microphone and sends the clip to the local WhisperX service for transcription. Audio never leaves your machine.</p>
+        <label class="switch-row">
+          <input type="checkbox" id="voiceEnabledToggle" />
+          <span>Enable voice input (mic button)</span>
+        </label>
+        <p class="muted" id="voiceCapabilityNote"></p>
+      </div>
+
+      <div class="card">
+        <h2>Context compression</h2>
+        <p class="muted">Long sessions get summarized so the model keeps a compact briefing of earlier turns instead of the raw transcript.</p>
+        <label class="switch-row">
+          <input type="checkbox" id="memCompressToggle" />
+          <span>Enable context compression</span>
+        </label>
+        <div class="form-grid">
+          <label>Compress when memory exceeds (chars)
+            <input type="number" id="memCompressThreshold" min="1000" max="200000" step="500" />
+          </label>
+          <label>Recent turns kept verbatim
+            <input type="number" id="memKeepRecent" min="1" max="20" />
+          </label>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Sub-agent spawning</h2>
+        <p class="muted">When the planner detects a multi-part request, it splits it into independent sub-tasks (chat + research), runs them in parallel, then synthesizes one answer.</p>
+        <label class="switch-row">
+          <input type="checkbox" id="subagentsToggle" />
+          <span>Enable sub-agent spawning</span>
+        </label>
+        <div class="form-grid">
+          <label>Maximum sub-agents per request
+            <input type="number" id="subagentsMax" min="2" max="6" />
+          </label>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Connection</h2>
+        <div class="form-grid">
+          <label>Ollama host
+            <input type="text" id="hostField" disabled />
+          </label>
+          <label>Active model
+            <input type="text" id="primaryField" disabled />
+          </label>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <!-- One-time voice opt-in modal. Shown on the first visit only; the user's
+       choice is stored in localStorage and can be changed later from Settings. -->
+  <div class="modal-backdrop" id="voiceOptInModal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="voiceOptInTitle">
+      <h2 id="voiceOptInTitle">Enable voice input?</h2>
+      <p>This local agent can transcribe your voice with WhisperX so you can talk to the model instead of typing. Microphone access happens only when you click the Talk button — nothing is recorded otherwise, and audio never leaves your machine.</p>
+      <p class="muted">You can change this later in <strong>Settings → Voice input</strong>.</p>
+      <div class="modal-actions">
+        <button type="button" class="ghost-btn" id="voiceOptOutBtn">Not now</button>
+        <button type="button" class="primary-btn" id="voiceOptInBtn">Enable voice</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
